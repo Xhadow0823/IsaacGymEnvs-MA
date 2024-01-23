@@ -7,9 +7,12 @@ import torch
 from isaacgym import gymtorch
 from isaacgym import gymapi
 
-from isaacgymenvs.utils.torch_jit_utils import quat_mul, to_torch, tensor_clamp  
+from isaacgymenvs.utils.torch_jit_utils import quat_mul, to_torch, tensor_clamp, quat_apply
 from isaacgymenvs.tasks.base.vec_task import VecTask
 
+# this block is for bypassing the type checking in reward function
+from torch import Tensor
+from typing import Dict, Tuple
 
 @torch.jit.script
 def axisangle2quat(vec, eps=1e-6):
@@ -78,7 +81,8 @@ class FrankaReach(VecTask):
         # obs include: cubeA_pose (7) + cubeB_pos (3) + eef_pose (7) + q_gripper (2)
         self.cfg["env"]["numObservations"] = 19 if self.control_type == "osc" else 26
         # actions include: delta EEF if OSC (6) or joint torques (7) + bool gripper (1)
-        self.cfg["env"]["numActions"] = 7 if self.control_type == "osc" else 8
+        # self.cfg["env"]["numActions"] = 7 if self.control_type == "osc" else 8
+        self.cfg["env"]["numActions"] = 6 if self.control_type == "osc" else 8  # 01/23 modified  remove actions of gripper(eef)
 
         # Values to be filled in at runtime
         self.states = {}                        # will be dict filled with relevant states to use for reward calculation
@@ -359,21 +363,21 @@ class FrankaReach(VecTask):
         self.num_dofs = self.gym.get_sim_dof_count(self.sim) // self.num_envs
 
         # Setup tensor buffers
-        _actor_root_state_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
-        _dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
-        _rigid_body_state_tensor = self.gym.acquire_rigid_body_state_tensor(self.sim)
-        self._root_state = gymtorch.wrap_tensor(_actor_root_state_tensor).view(self.num_envs, -1, 13)
-        self._dof_state = gymtorch.wrap_tensor(_dof_state_tensor).view(self.num_envs, -1, 2)
-        self._rigid_body_state = gymtorch.wrap_tensor(_rigid_body_state_tensor).view(self.num_envs, -1, 13)
-        self._q = self._dof_state[..., 0]
-        self._qd = self._dof_state[..., 1]
+        _actor_root_state_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)  # shape: (n_actors of all envs, 13), 13 is position[3], rotation[4], linear velocity and angular velocity
+        _dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)  # shape: (n_dof, 2), 2 is position and velocity of the dof
+        _rigid_body_state_tensor = self.gym.acquire_rigid_body_state_tensor(self.sim)  # shape: (n_rigid_body, 13)
+        self._root_state = gymtorch.wrap_tensor(_actor_root_state_tensor).view(self.num_envs, -1, 13)  # change into (n_envs, n_actors in the env, 13)
+        self._dof_state = gymtorch.wrap_tensor(_dof_state_tensor).view(self.num_envs, -1, 2)  # change into (n_envs, n_dof of the env, 2)
+        self._rigid_body_state = gymtorch.wrap_tensor(_rigid_body_state_tensor).view(self.num_envs, -1, 13) # change into (n_envs, n_rigid_body of the env, 13)
+        self._q = self._dof_state[..., 0]  # (n_envs, n_dof of the env)'s position
+        self._qd = self._dof_state[..., 1]  # (n_envs, n_dof of the env)'s velocity
         self._eef_state = self._rigid_body_state[:, self.handles["grip_site"], :]
         self._eef_lf_state = self._rigid_body_state[:, self.handles["leftfinger_tip"], :]
         self._eef_rf_state = self._rigid_body_state[:, self.handles["rightfinger_tip"], :]
         _jacobian = self.gym.acquire_jacobian_tensor(self.sim, "franka")
-        jacobian = gymtorch.wrap_tensor(_jacobian)
+        jacobian = gymtorch.wrap_tensor(_jacobian)  # (n_envs, joints, ?, ?)
         hand_joint_index = self.gym.get_actor_joint_dict(env_ptr, franka_handle)['panda_hand_joint']
-        self._j_eef = jacobian[:, hand_joint_index, :, :7]
+        self._j_eef = jacobian[:, hand_joint_index, :, :7]   # why
         _massmatrix = self.gym.acquire_mass_matrix_tensor(self.sim, "franka")
         mm = gymtorch.wrap_tensor(_massmatrix)
         self._mm = mm[:, :7, :7]
@@ -387,6 +391,7 @@ class FrankaReach(VecTask):
         })
 
         # Initialize actions
+        # these 2 properties are used to set the actor states in the simulation (in self.pre_physics_step())
         self._pos_control = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
         self._effort_control = torch.zeros_like(self._pos_control)
 
@@ -399,6 +404,7 @@ class FrankaReach(VecTask):
                                            device=self.device).view(self.num_envs, -1)
 
     def _update_states(self):
+        """update the self.state"""
         self.states.update({
             # Franka
             "q": self._q[:, :],
@@ -418,6 +424,7 @@ class FrankaReach(VecTask):
         })
 
     def _refresh(self):
+        """this is to update the self.state for compute_observations() """
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
@@ -432,10 +439,20 @@ class FrankaReach(VecTask):
             self.reset_buf, self.progress_buf, self.actions, self.states, self.reward_settings, self.max_episode_length
         )
 
+# TODO: 01/23 to  remove the obs of eef(gripper) and the info about CubeB
     def compute_observations(self):
+        # obs spec:
+        #   cubeA_quat: 4
+        #   cubeA_pos: 3
+        #   cubeA_to_cubeB_pos: 3
+        #   eef_pos: 3
+        #   eef_quat: 4
+        #   q_gripper: 2
+        # total size: 19
+
         self._refresh()
         obs = ["cubeA_quat", "cubeA_pos", "cubeA_to_cubeB_pos", "eef_pos", "eef_quat"]
-        obs += ["q_gripper"] if self.control_type == "osc" else ["q"]
+        obs += ["q_gripper"] if self.control_type == "osc" else ["q"]  # q_gripper is the last two element of the q
         self.obs_buf = torch.cat([self.states[ob] for ob in obs], dim=-1)
 
         maxs = {ob: torch.max(self.states[ob]).item() for ob in obs}
@@ -586,6 +603,7 @@ class FrankaReach(VecTask):
         this_cube_state_all[env_ids, :] = sampled_cube_state
 
     def _compute_osc_torques(self, dpose):
+        """anti-hurt-self function, output size is (n, 7) no matter the dpose size"""
         # Solve for Operational Space Control # Paper: khatib.stanford.edu/publications/pdfs/Khatib_1987_RA.pdf
         # Helpful resource: studywolf.wordpress.com/2013/09/17/robot-control-4-operation-space-control/
         q, qd = self._q[:, :7], self._qd[:, :7]
@@ -613,11 +631,15 @@ class FrankaReach(VecTask):
 
         return u
 
+    # 01/23 modified  remove gripper
     def pre_physics_step(self, actions):
+        """do preprocess of the actions from actor and send them into the simulation """
         self.actions = actions.clone().to(self.device)
+        # print( self.actions.shape )
 
         # Split arm and gripper command
-        u_arm, u_gripper = self.actions[:, :-1], self.actions[:, -1]
+        # u_arm, u_gripper = self.actions[:, :-1], self.actions[:, -1]
+        u_arm = self.actions[:, :6]  # shape: (n_envs, 6) u_arn size is the same
 
         # print(u_arm, u_gripper)
         # print(self.cmd_limit, self.action_scale)
@@ -625,20 +647,23 @@ class FrankaReach(VecTask):
         # Control arm (scale value first)
         u_arm = u_arm * self.cmd_limit / self.action_scale
         if self.control_type == "osc":
-            u_arm = self._compute_osc_torques(dpose=u_arm)
-        self._arm_control[:, :] = u_arm
+            u_arm = self._compute_osc_torques(dpose=u_arm)  # NOTE: this is for anti-hurt-self function
+            pass
+        self._arm_control[:, :6] = u_arm[:, :6]
 
         # Control gripper
-        u_fingers = torch.zeros_like(self._gripper_control)
-        u_fingers[:, 0] = torch.where(u_gripper >= 0.0, self.franka_dof_upper_limits[-2].item(),
-                                      self.franka_dof_lower_limits[-2].item())
-        u_fingers[:, 1] = torch.where(u_gripper >= 0.0, self.franka_dof_upper_limits[-1].item(),
-                                      self.franka_dof_lower_limits[-1].item())
-        # Write gripper command to appropriate tensor buffer
-        self._gripper_control[:, :] = u_fingers
+        # u_fingers = torch.zeros_like(self._gripper_control)
+        # u_fingers[:, 0] = torch.where(u_gripper >= 0.0, self.franka_dof_upper_limits[-2].item(),
+        #                               self.franka_dof_lower_limits[-2].item())
+        # u_fingers[:, 1] = torch.where(u_gripper >= 0.0, self.franka_dof_upper_limits[-1].item(),
+        #                               self.franka_dof_lower_limits[-1].item())
+        # # Write gripper command to appropriate tensor buffer
+        # self._gripper_control[:, :] = u_fingers
 
         # Deploy actions
-        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self._pos_control))
+        # self._gripper_control is partial view of self._pos_control
+        # self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self._pos_control))  # we dont need this control anymore
+        # self._arm_control is partial view of self._effort_control
         self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self._effort_control))
 
     def post_physics_step(self):
