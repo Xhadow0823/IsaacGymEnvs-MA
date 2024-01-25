@@ -682,6 +682,8 @@ class FrankaReach(VecTask):
     def post_physics_step(self):
         self.progress_buf += 1
 
+        # print(self.progress_buf[0])
+
         env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(env_ids) > 0:
             self.reset_idx(env_ids)
@@ -809,7 +811,8 @@ def compute_franka_reward(
 
     # version 7
     dist_reward = torch.exp(-d) * 10
-    touch_bonus = torch.where(d <= states["cubeA_size"]/2, 15, 0)
+    remain_bonus = (1 - progress_buf / max_episode_length) * 50
+    touch_bonus = torch.where(d <= states["cubeA_size"]/2, remain_bonus, torch.zeros_like(remain_bonus))
     rewards = dist_reward + touch_bonus
 
     # Compute resets
