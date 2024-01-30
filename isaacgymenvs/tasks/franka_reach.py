@@ -80,10 +80,10 @@ class FrankaReach(VecTask):
         # dimensions
         # obs include: cubeA_pose (7) + cubeB_pos (3) + eef_pose (7) + q_gripper (2)
         # self.cfg["env"]["numObservations"] = 19 if self.control_type == "osc" else 26
-        self.cfg["env"]["numObservations"] = 7 if self.control_type == "osc" else 26  # 0123 modified  obs is 3+4(cubeA_pose) now
+        self.cfg["env"]["numObservations"] = 14 if self.control_type == "osc" else 7  # 0123 modified  obs is 3+4(cubeA_pose) now
         # actions include: delta EEF if OSC (6) or joint torques (7) + bool gripper (1)
         # self.cfg["env"]["numActions"] = 7 if self.control_type == "osc" else 8
-        self.cfg["env"]["numActions"] = 6 if self.control_type == "osc" else 8  # 0123 modified  remove actions of gripper(eef)
+        self.cfg["env"]["numActions"] = 6 if self.control_type == "osc" else 7  # 0123 modified  remove actions of gripper(eef)
 
         # Values to be filled in at runtime
         self.states = {}                        # will be dict filled with relevant states to use for reward calculation
@@ -440,7 +440,8 @@ class FrankaReach(VecTask):
             self.reset_buf, self.progress_buf, self.actions, self.states, self.reward_settings, self.max_episode_length
         )
 
-# TODO: 01/23 to  remove the obs of eef(gripper) and the info about CubeB
+# modified 01/23  remove the obs of eef(gripper) and the info about CubeB
+# modified 01/30  add eef_pos and eef_quat into obs space, and the result is very good!!
     def compute_observations(self):
         # old obs spec:
         #   cubeA_quat: 4
@@ -454,11 +455,13 @@ class FrankaReach(VecTask):
         # -> new obs spec:
         #   cubeA_quat: 4
         #   cubeA_pos: 3
-        # total size: 7
+        #   eef_quat: 4
+        #   eef_pos: 3
+        # total size: 14
 
         self._refresh()
-        # obs = ["cubeA_quat", "cubeA_pos", "cubeA_to_cubeB_pos", "eef_pos", "eef_quat"]
-        obs = ["cubeA_quat", "cubeA_pos"]
+        # obs = ["cubeA_quat", "cubeA_pos", "cubeA_to_cubeB_pos", "eef_pos", "eef_quat"]  # original
+        obs = ["cubeA_quat", "cubeA_pos", "eef_quat", "eef_pos"]
         # obs += ["q_gripper"] if self.control_type == "osc" else ["q"]  # q_gripper is the last two element of the q
         self.obs_buf = torch.cat([self.states[ob] for ob in obs], dim=-1)
 
@@ -662,6 +665,7 @@ class FrankaReach(VecTask):
         if self.control_type == "osc":
             u_arm = self._compute_osc_torques(dpose=u_arm)  # NOTE: this is for anti-hurt-self function
             pass
+        
         self._arm_control[:, :6] = u_arm[:, :6]
 
         # Control gripper
@@ -808,12 +812,20 @@ def compute_franka_reward(
     # version 6
     # dist_punish = -d
     # rewards += dist_punish
-
     # version 7
-    dist_reward = torch.exp(-d) * 10
-    remain_bonus = (1 - progress_buf / max_episode_length) * 50
-    touch_bonus = torch.where(d <= states["cubeA_size"]/2, remain_bonus, torch.zeros_like(remain_bonus))
-    rewards = dist_reward + touch_bonus
+    # dist_reward = torch.exp(-d) * 10
+    # remain_bonus = (1 - progress_buf / max_episode_length) * 50
+    # touch_bonus = torch.where(d <= states["cubeA_size"]/2, remain_bonus, torch.zeros_like(remain_bonus))
+    # rewards = dist_reward + touch_bonus
+    # version 8
+    # dist_reward = 1.0 / (1.0 + d * d)
+    # rewards = dist_reward
+
+    # version 9
+    dist_reward = 1.0 / (1.0 + d * d)
+    actions_cost = torch.sum(actions ** 2, dim=-1) * 0.01
+    rewards = dist_reward - actions_cost
+    rewards = torch.clip(rewards, 0., None)
 
     # Compute resets
     reset_buf = torch.where(
