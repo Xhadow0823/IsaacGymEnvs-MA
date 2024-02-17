@@ -13,39 +13,7 @@ from isaacgymenvs.tasks.base.vec_task import VecTask
 from torch import Tensor
 from typing import Dict, Tuple
 
-@torch.jit.script
-def axisangle2quat(vec, eps=1e-6):
-    """
-    Converts scaled axis-angle to quat.
-    Args:
-        vec (tensor): (..., 3) tensor where final dim is (ax,ay,az) axis-angle exponential coordinates
-        eps (float): Stability value below which small values will be mapped to 0
-
-    Returns:
-        tensor: (..., 4) tensor where final dim is (x,y,z,w) vec4 float quaternion
-    """
-    # type: (Tensor, float) -> Tensor
-    # store input shape and reshape
-    input_shape = vec.shape[:-1]
-    vec = vec.reshape(-1, 3)
-
-    # Grab angle
-    angle = torch.norm(vec, dim=-1, keepdim=True)
-
-    # Create return array
-    quat = torch.zeros(torch.prod(torch.tensor(input_shape)), 4, device=vec.device)
-    quat[:, 3] = 1.0
-
-    # Grab indexes where angle is not zero an convert the input to its quaternion form
-    idx = angle.reshape(-1) > eps
-    quat[idx, :] = torch.cat([
-        vec[idx, :] * torch.sin(angle[idx, :] / 2.0) / angle[idx, :],
-        torch.cos(angle[idx, :] / 2.0)
-    ], dim=-1)
-
-    # Reshape and return output
-    quat = quat.reshape(list(input_shape) + [4, ])
-    return quat
+from .franka_reach import axisangle2quat
 
 
 class FrankaReachMA(VecTask):
@@ -84,29 +52,79 @@ class FrankaReachMA(VecTask):
 
         # Values to be filled in at runtime
         self.states = {}                        # will be dict filled with relevant states to use for reward calculation
+        '''Dict[str, tensor] , 各種 actor, dof 和 rigid body state 的 partial view'''
         self.handles = {}                       # will be dict mapping names to relevant sim handles
-        self.num_dofs = None                    # Total number of DOFs per env
-        self.actions = None                     # Current actions to be deployed
-        self._init_cubeA_state = None           # Initial state of cubeA for the current env
-        self._cubeA_state = None                # Current state of cubeA for the current env
-        self._cubeA_id = None                   # Actor ID corresponding to cubeA for a given env
+        '''[Dict[str, int] , rigid body name 對應到其在一個 env 中的 一個 actor 的 idx \ 
+        用 find_actor_rigid_body_handle 依據 (env, actor, rigid_body_name) 找到的 idx \ 
+        ''' # TODO: 需要再三檢查這個
 
+        self.num_dofs = None                    # Total number of DOFs per env
+        '''int, 一個env有多少dof'''
+        self.actions = None                     # Current actions to be deployed
+        '''網路輸出的 actions ，這個tensor 會在 pre_physics_step 中被設定，並前處理完再套用到actor上'''
+        self._init_cubeA_state = None           # Initial state of cubeA for the current env
+        ''' cubeA 的  初始 actor state (姿態) \ 
+        (n_envs x 13)
+        '''
+        self._cubeA_state = None                # Current state of cubeA for the current env
+        ''' cubeA 的  初始 actor state (姿態) \ 
+        (n_envs x 13)
+        '''
+        self._cubeA_id = None                   # Actor ID corresponding to cubeA for a given env
+        ''' actor cubeA 的 handle (就是 env 中的 idx) '''
+        
         # Tensor placeholders
         self._root_state = None             # State of root body        (n_envs, 13)
+        '''每個env 的每個 actor state， actor 的 state 就是姿態 \ 
+        (n_envs x n_actors_per_env x 13), 13 is position[3], rotation[4], linear velocity and angular velocity
+        '''
         self._dof_state = None  # State of all joints       (n_envs, n_dof)
+        '''每個 env 的每個 dof 的 state， state 就是 position 和 velocity \ 
+        (n_envs x n_dofs_per_env x 2), 2 is position and velocity of a dof
+        '''
         self._q = None  # Joint positions           (n_envs, n_dof)
+        '''這是 _dof_state 的 partial view，它有每個 env 的每個 dof 的 position \ 
+        (n_envs x n_dofs_per_env)
+        '''
         self._qd = None                     # Joint velocities          (n_envs, n_dof)
+        '''這是 _dof_state 的 partial view，它有每個 env 的每個 dof 的 velocity \ 
+        (n_envs x n_dofs_per_env)
+        '''
         self._rigid_body_state = None  # State of all rigid bodies             (n_envs, n_bodies, 13)
+        '''每個env的每個 rigid body 的 state （就是姿態，跟actor state 一樣）\ 
+        (n_envs x n_rigid_body_per_env x 13) 13 is position[3], rotation[4], linear velocity and angular velocity
+        '''
         self._contact_forces = None     # Contact forces in sim
+        '''碰撞的 force 資訊，目前沒有用到'''
         self._eef_state = None  # end effector state (at grasping point)
+        ''' 是 _rigid_body_state 的 partial view,  panda_grip_site 這個 rigid body 的 state \ 
+        '''
         self._eef_lf_state = None  # end effector state (at left fingertip)
+        ''' 是 _rigid_body_state 的 partial view \ 
+        '''
         self._eef_rf_state = None  # end effector state (at left fingertip)
+        ''' 是 _rigid_body_state 的 partial view \ 
+        '''
         self._j_eef = None  # Jacobian for end effector
+        ''' 是 _rigid_body_state 的 partial view \ 
+        '''
         self._mm = None  # Mass matrix
         self._arm_control = None  # Tensor buffer for controlling arm
+        '''是_effort_control的partial view \ 
+        (num_envs x (num_dofs_per_arm x num_arms))
+        '''
         self._gripper_control = None  # Tensor buffer for controlling gripper
+        '''是_pos_control的partial view \ 
+        (num_envs x (2 x num_arms))
+        '''
         self._pos_control = None            # Position actions
+        '''被用來設定 actor 的關節位置控制
+        (num_envs x num_dofs)
+        '''
         self._effort_control = None         # Torque actions
+        '''被用來設定 actor 的功率控制
+        (num_envs x num_dofs)
+        '''
         self._franka_effort_limits = None        # Actuator effort limits for franka
         self._global_indices = None         # Unique indices corresponding to all envs in flattened array
 
@@ -119,7 +137,7 @@ class FrankaReachMA(VecTask):
 
         # modified 0122  add camera look at
         if self.viewer != None:
-            cam_pos    = gymapi.Vec3(6.0, 6.0, 3.4)
+            cam_pos    = gymapi.Vec3(5.0, 5.0, 3.4)
             cam_target = gymapi.Vec3(0.0, 0.0, 1.0)
             self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
 
@@ -200,7 +218,7 @@ class FrankaReachMA(VecTask):
         table_stand_asset = self.gym.create_box(self.sim, *[0.2, 0.2, table_stand_height], table_opts)
 
         self.cubeA_size = 0.050
-        self.cubeB_size = 0.070
+        # self.cubeB_size = 0.070
 
         # Create cubeA asset
         cubeA_opts = gymapi.AssetOptions()
@@ -286,7 +304,7 @@ class FrankaReachMA(VecTask):
             env_ptr = self.gym.create_env(self.sim, lower, upper, num_per_row)
 
             # Create actors and define aggregate group appropriately depending on setting
-            # NOTE: franka should ALWAYS be loaded first in sim!
+            # NOTE: franka should ALWAYS be loaded first in sim! !!!!!!!!!!!!!!!!!!!!!!     # NOTE: this will be a big problem in building MA version
             if self.aggregate_mode >= 3:
                 self.gym.begin_aggregate(env_ptr, max_agg_bodies, max_agg_shapes, True)
 
@@ -332,6 +350,13 @@ class FrankaReachMA(VecTask):
             self.envs.append(env_ptr)
             self.frankas.append(franka_actor)
 
+        for env_ptr in self.envs:
+            franka_start_pose2 = gymapi.Transform()
+            franka_start_pose2.p = gymapi.Vec3(-0.45 + 0.6, 0.0 + 0.6, 1.0 + table_thickness / 2 + table_stand_height)
+            franka_start_pose2.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
+            franka_actor2 = self.gym.create_actor(env_ptr, franka_asset, franka_start_pose2, "franka2", i, 2, 0)  # test
+            self.gym.set_actor_dof_properties(env_ptr, franka_actor2, franka_dof_props)
+
         # Setup init state buffer
         self._init_cubeA_state = torch.zeros(self.num_envs, 13, device=self.device)
         # self._init_cubeB_state = torch.zeros(self.num_envs, 13, device=self.device)
@@ -342,7 +367,7 @@ class FrankaReachMA(VecTask):
     def init_data(self):
         # Setup sim handles
         env_ptr = self.envs[0]
-        franka_handle = 0
+        franka_handle = 0  # NOTE 這就是為什麼建立 env 時，作者說 franka 必須是第一個加進去的 actor 的原因（刻意被放在 idx 0)
         self.handles = {
             # Franka
             "hand": self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle, "panda_hand"),
@@ -391,8 +416,8 @@ class FrankaReachMA(VecTask):
         self._effort_control = torch.zeros_like(self._pos_control)
 
         # Initialize control
-        self._arm_control = self._effort_control[:, :7]
-        self._gripper_control = self._pos_control[:, 7:9]
+        self._arm_control = self._effort_control[:, :7]  # TODO: change the partial view source
+        self._gripper_control = self._pos_control[:, 7:9] # TODO: change the partial view source
 
         # Initialize indices
         self._global_indices = torch.arange(self.num_envs * 4, dtype=torch.int32,  # 0123 modified  remove cube so n_actors in a env is 4 now
@@ -470,8 +495,11 @@ class FrankaReachMA(VecTask):
         # Overwrite gripper init pos (no noise since these are always position controlled)
         pos[:, -2:] = self.franka_default_dof_pos[-2:]
 
+        # NOTE: pos size have to be change later
+        pos = torch.cat((pos, pos), 1)
+
         # Reset the internal obs accordingly
-        self._q[env_ids, :] = pos
+        self._q[env_ids, :] = pos  # NOTE: something wrong
         self._qd[env_ids, :] = torch.zeros_like(self._qd[env_ids])
 
         # Set any position control to the current position, and any vel / effort control to be 0
