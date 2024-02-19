@@ -97,6 +97,7 @@ def launch_rlg_hydra(cfg: DictConfig):
     from isaacgymenvs.learning import amp_players
     from isaacgymenvs.learning import amp_models
     from isaacgymenvs.learning import amp_network_builder
+    from isaacgymenvs.learning import A2CAgent_MA
     import isaacgymenvs
 
 
@@ -186,6 +187,7 @@ def launch_rlg_hydra(cfg: DictConfig):
         runner = Runner(algo_observer)
         runner.algo_factory.register_builder('amp_continuous', lambda **kwargs : amp_continuous.AMPAgent(**kwargs))
         runner.player_factory.register_builder('amp_continuous', lambda **kwargs : amp_players.AMPPlayerContinuous(**kwargs))
+        runner.algo_factory.register_builder('a2c_continuous_MA', lambda **kwargs : A2CAgent_MA.A2CAgentMA(**kwargs))  # NOTE: A2CAgent for MA
         model_builder.register_model('continuous_amp', lambda network, **kwargs : amp_models.ModelAMPContinuous(network))
         model_builder.register_network('amp', lambda **kwargs : amp_network_builder.AMPBuilder())
 
