@@ -127,7 +127,11 @@ class FrankaReachMA(VecTask):
         '''
         self._franka_effort_limits = None        # Actuator effort limits for franka
         self._global_indices = None         # Unique indices corresponding to all envs in flattened array
-
+        '''所有的 env 的 所有 actor 的 indices，可以被用來作為 mask \ 
+        (num_envs x num_actors_per_env), \ 
+        ex: [[1 2 3][4 5 6]]
+        ''' # TODO: 因為這個 uuid 規則改變了，所以有用到這個 array的 buffer 很可能是壞掉的
+        
         self.debug_viz = self.cfg["env"]["enableDebugVis"]
 
         self.up_axis = "z"
@@ -350,7 +354,7 @@ class FrankaReachMA(VecTask):
             self.envs.append(env_ptr)
             self.frankas.append(franka_actor)
 
-        for env_ptr in self.envs:
+            # ====================== OTHER ARMS =====================================
             franka_start_pose2 = gymapi.Transform()
             franka_start_pose2.p = gymapi.Vec3(-0.45 + 0.6, 0.0 + 0.6, 1.0 + table_thickness / 2 + table_stand_height)
             franka_start_pose2.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
@@ -420,7 +424,7 @@ class FrankaReachMA(VecTask):
         self._gripper_control = self._pos_control[:, 7:9] # TODO: change the partial view source
 
         # Initialize indices
-        self._global_indices = torch.arange(self.num_envs * 4, dtype=torch.int32,  # 0123 modified  remove cube so n_actors in a env is 4 now
+        self._global_indices = torch.arange(self.num_envs * (3+self.num_arms_per_env), dtype=torch.int32,  # 0123 modified  remove cube so n_actors in a env is 4 now
                                            device=self.device).view(self.num_envs, -1)
 
     def _update_states(self):
@@ -468,7 +472,7 @@ class FrankaReachMA(VecTask):
         obs = ["cubeA_quat", "cubeA_pos", "eef_quat", "eef_pos"]  # 14 obs version, better a lots
         self.obs_buf = torch.cat([self.states[ob] for ob in obs], dim=-1)
 
-        maxs = {ob: torch.max(self.states[ob]).item() for ob in obs}
+        # maxs = {ob: torch.max(self.states[ob]).item() for ob in obs}  # unused gy author
 
         return self.obs_buf
 
@@ -499,7 +503,7 @@ class FrankaReachMA(VecTask):
         pos = torch.cat((pos, pos), 1)
 
         # Reset the internal obs accordingly
-        self._q[env_ids, :] = pos  # NOTE: something wrong
+        self._q[env_ids, :] = pos  # NOTE: something wrong  # (n_envs x (n_arms*9) ?
         self._qd[env_ids, :] = torch.zeros_like(self._qd[env_ids])
 
         # Set any position control to the current position, and any vel / effort control to be 0
@@ -509,6 +513,8 @@ class FrankaReachMA(VecTask):
 
         # Deploy updates
         multi_env_ids_int32 = self._global_indices[env_ids, 0].flatten()
+        multi_env_ids_cubes_int32 = self._global_indices[env_ids, 3].flatten()  # TODO: malfunction in multi-arm version
+
         self.gym.set_dof_position_target_tensor_indexed(self.sim,
                                                         gymtorch.unwrap_tensor(self._pos_control),
                                                         gymtorch.unwrap_tensor(multi_env_ids_int32),
@@ -517,16 +523,17 @@ class FrankaReachMA(VecTask):
                                                         gymtorch.unwrap_tensor(self._effort_control),
                                                         gymtorch.unwrap_tensor(multi_env_ids_int32),
                                                         len(multi_env_ids_int32))
-        self.gym.set_dof_state_tensor_indexed(self.sim,
+        self.gym.set_dof_state_tensor_indexed(self.sim,                                      # 設定 dof_state 是為了 _q 和 _qd (partial view of dof_state)
                                               gymtorch.unwrap_tensor(self._dof_state),
                                               gymtorch.unwrap_tensor(multi_env_ids_int32),
                                               len(multi_env_ids_int32))
 
         # Update cube states
-        multi_env_ids_cubes_int32 = self._global_indices[env_ids, -2:].flatten()
-        self.gym.set_actor_root_state_tensor_indexed(
-            self.sim, gymtorch.unwrap_tensor(self._root_state),
-            gymtorch.unwrap_tensor(multi_env_ids_cubes_int32), len(multi_env_ids_cubes_int32))
+        # multi_env_ids_cubes_int32 = self._global_indices[env_ids, 3].flatten()  # TODO: malfunction in multi-arm version
+        self.gym.set_actor_root_state_tensor_indexed(self.sim, 
+                                                     gymtorch.unwrap_tensor(self._root_state),
+                                                     gymtorch.unwrap_tensor(multi_env_ids_cubes_int32), 
+                                                     len(multi_env_ids_cubes_int32))
 
         self.progress_buf[env_ids] = 0
         self.reset_buf[env_ids] = 0
