@@ -100,6 +100,7 @@ class Env(ABC):
 
         self.num_environments = config["env"]["numEnvs"]
         self.num_agents = config["env"].get("numAgents", 1)  # used for multi-agent environments
+        '''每個 env 有多少 agent '''
 
         self.num_observations = config["env"].get("numObservations", 0)
         self.num_states = config["env"].get("numStates", 0)
@@ -322,6 +323,7 @@ class VecTask(Env):
         self.randomize_buf = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.long)
         self.extras = {}
+        ''' this is the info_buf or env_info'''
 
     def create_sim(self, compute_device: int, graphics_device: int, physics_engine, sim_params: gymapi.SimParams):
         """Create an Isaac Gym sim object.

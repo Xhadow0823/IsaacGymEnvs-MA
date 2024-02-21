@@ -18,10 +18,29 @@ from .franka_reach import axisangle2quat
 
 class FrankaReachMA(VecTask):
 
+    # Override the VecTask
+    def allocate_buffers(self):
+        '''the self.obs_buf dimension have changed'''
+        # self.num_agents = 2 # this is for testing
+
+        # allocate all buffers
+        # then override the obs and rew buffer for multi-agent
+        super().allocate_buffers()
+        self.obs_buf = torch.zeros((self.num_envs * self.num_agents, self.num_obs), 
+                                   device=self.device, dtype=torch.float)
+        self.rew_buf = torch.zeros(self.num_envs * self.num_agents, 
+                                   device=self.device, dtype=torch.float)
+        self.reset_buf = torch.ones(self.num_envs * self.num_agents, 
+                                    device=self.device, dtype=torch.long)
+        self.timeout_buf = torch.zeros(self.num_envs * self.num_agents, 
+                                       device=self.device, dtype=torch.long)
+        self.progress_buf = torch.zeros(self.num_envs * self.num_agents, 
+                                        device=self.device, dtype=torch.long)
+
     def __init__(self, cfg, rl_device, sim_device, graphics_device_id, headless, virtual_screen_capture, force_render):
         self.cfg = cfg
 
-        self.num_arms_per_env = self.cfg["env"]["numArmsPerEnv"]  # one env have num_arms_per_env arms
+        # using self.num_agents for get the num_arms_per_env
 
         self.max_episode_length = self.cfg["env"]["episodeLength"]
 
@@ -55,8 +74,9 @@ class FrankaReachMA(VecTask):
         '''Dict[str, tensor] , 各種 actor, dof 和 rigid body state 的 partial view'''
         self.handles = {}                       # will be dict mapping names to relevant sim handles
         '''[Dict[str, int] , rigid body name 對應到其在一個 env 中的 一個 actor 的 idx \ 
-        用 find_actor_rigid_body_handle 依據 (env, actor, rigid_body_name) 找到的 idx \ 
-        ''' # TODO: 需要再三檢查這個
+        用 find_actor_rigid_body_handle 依據 (env, actor, rigid_body_name) 找到的 idx
+        ''' 
+        # TODO: 需要再三檢查這個 
 
         self.num_dofs = None                    # Total number of DOFs per env
         '''int, 一個env有多少dof'''
@@ -424,7 +444,8 @@ class FrankaReachMA(VecTask):
         self._gripper_control = self._pos_control[:, 7:9] # TODO: change the partial view source
 
         # Initialize indices
-        self._global_indices = torch.arange(self.num_envs * (3+self.num_arms_per_env), dtype=torch.int32,  # 0123 modified  remove cube so n_actors in a env is 4 now
+        # TODO: 確保這個 global indice 維度與內容可以正確對應到所有 actors
+        self._global_indices = torch.arange(self.num_envs * (3+self.num_agents), dtype=torch.int32,  # 0123 modified  remove cube so n_actors in a env is 4 now
                                            device=self.device).view(self.num_envs, -1)
 
     def _update_states(self):
@@ -456,9 +477,13 @@ class FrankaReachMA(VecTask):
         self._update_states()
 
     def compute_reward(self, actions):
+        # self.rew_buf[:], self.reset_buf[:] = compute_franka_reward(
+        #     self.reset_buf, self.progress_buf, self.actions, self.states, self.reward_settings, self.max_episode_length
+        # )  # change reset_buf to timeout_buf for testing
         self.rew_buf[:], self.reset_buf[:] = compute_franka_reward(
-            self.reset_buf, self.progress_buf, self.actions, self.states, self.reward_settings, self.max_episode_length
-        )
+            self.timeout_buf, self.progress_buf, self.actions, self.states, self.reward_settings, self.max_episode_length
+        )  # change reset_buf to timeout_buf for testing
+        # NOTE: 目前將參數中的 reset_buf 改為 timeout_buf ，因為判斷 reset 條件目前僅有 timeout
 
     def compute_observations(self):
         # -> new obs spec:
@@ -471,11 +496,14 @@ class FrankaReachMA(VecTask):
         self._refresh()
         obs = ["cubeA_quat", "cubeA_pos", "eef_quat", "eef_pos"]  # 14 obs version, better a lots
         self.obs_buf = torch.cat([self.states[ob] for ob in obs], dim=-1)
+        # TODO: 將 obs_buf 中的內容確實對應到所有 agents 
+        self.obs_buf = torch.cat([self.obs_buf, self.obs_buf], dim=0)  # this is for testing
 
         # maxs = {ob: torch.max(self.states[ob]).item() for ob in obs}  # unused gy author
 
         return self.obs_buf
 
+    # NOTE: 目前 reset 機能因 buffer 大小的修改而失效中!! （請見本 function 最後面）
     def reset_idx(self, env_ids):
         env_ids_int32 = env_ids.to(dtype=torch.int32)
 
@@ -534,9 +562,14 @@ class FrankaReachMA(VecTask):
                                                      gymtorch.unwrap_tensor(self._root_state),
                                                      gymtorch.unwrap_tensor(multi_env_ids_cubes_int32), 
                                                      len(multi_env_ids_cubes_int32))
-
-        self.progress_buf[env_ids] = 0
-        self.reset_buf[env_ids] = 0
+        # original 
+        # self.progress_buf[env_ids] = 0
+        # self.reset_buf[env_ids] = 0
+        # new, just for testing
+        new_env_ids = torch.cat([env_ids, env_ids + 2], dim=0)
+        self.progress_buf[new_env_ids] = 0
+        self.reset_buf[new_env_ids] = 0
+        # TODO: 這邊要考慮是否要將 env_ids 維度改為 num_envs x num_agents，並改變 reset cube state 接收的 env_ids 讀取規則
 
     # 0123 modified  remove cubeB
     def _reset_init_cube_state(self, cube, env_ids, check_valid=True):
@@ -557,6 +590,8 @@ class FrankaReachMA(VecTask):
         # If env_ids is None, we reset all the envs
         if env_ids is None:
             env_ids = torch.arange(start=0, end=self.num_envs, device=self.device, dtype=torch.long)
+        # TODO: make sure the size of env_ids is <= 2
+        # TODO: 如果將來將 env_ids 改為更大的維度，這邊需要改變讀取 env_ids 對應到 cube 的規則
 
         # Initialize buffer to hold sampled values
         num_resets = len(env_ids)
@@ -641,14 +676,15 @@ class FrankaReachMA(VecTask):
 
         return u
 
-    # 01/23 modified  remove gripper
+    # TODO: 這邊是負責將經 NN 推理出的 actions 套用到 agents 上，流程待設計（目前流程無實際機能，僅供測試）
     def pre_physics_step(self, actions):
-        """do preprocess of the actions from actor and send them into the simulation """
+        """do preprocess of the actions from actor and send them into the simulation"""
         self.actions = actions.clone().to(self.device)
 
         # Split arm and gripper command
         # u_arm, u_gripper = self.actions[:, :-1], self.actions[:, -1]
         u_arm = self.actions[:, :6]  # shape: (n_envs, 6) u_arn size is the same
+        u_arm = u_arm[:2, :]  # NOTE: this is for testing !!!!!!!!
 
         u_arm = u_arm * self.cmd_limit / self.action_scale
         if self.control_type == "osc":
@@ -704,16 +740,17 @@ class FrankaReachMA(VecTask):
 #####################################################################
 
 
-bonus_rate = None
+# TODO: 這邊除了第一個維度有變動，後面幾個維度對舊的演算法沒有太大影響。將來要加上與團體有關的 reward 可以建立新 function 並修改這裡。
+# TODO: 應為第一個維度修改了，所以我們需要針對多個 agents 去計算其 reward，目前僅計算第一個 agent 的獎勵，待修正。
 @torch.jit.script
 def compute_franka_reward(
-    reset_buf, progress_buf, actions, states, reward_settings, max_episode_length
+    timeout_buf, progress_buf, actions, states, reward_settings, max_episode_length
 ):
     # type: (Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, float], float) -> Tuple[Tensor, Tensor]  # NOTE: this line is important for type checker
-    
+    actions = actions[:2, :]  # this is for testing !!!  the old algorithm only accept 2 x n dimension
+
     # distance from hand to the cubeA
     d = torch.norm(states["cubeA_pos"] - states["eef_pos"], dim=-1)
-   
     # version 9
     dist_reward = 1.0 / (1.0 + d * d)
     actions_cost = torch.sum(actions ** 2, dim=-1) * 0.01
@@ -721,9 +758,9 @@ def compute_franka_reward(
     rewards = torch.clip(rewards, 0., None)
 
     # Compute resets
-    reset_buf = torch.where(
-        # (progress_buf >= max_episode_length - 1) | (d <= states["cubeA_size"]/2), 
-        (progress_buf >= max_episode_length - 1), 
-        torch.ones_like(reset_buf), reset_buf)
+    # env_reset_buf = torch.where((progress_buf >= max_episode_length - 1), torch.ones_like(reset_buf), reset_buf)
+    reset_buf = timeout_buf  # this is for testing !!!  we needs 4 x n reward format
+
+    rewards = torch.cat([rewards, rewards], dim=0)  # this is for testing !!!  we needs 4 x n reward format
 
     return rewards, reset_buf

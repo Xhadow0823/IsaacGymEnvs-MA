@@ -255,10 +255,12 @@ class RLGPUEnv(vecenv.IVecEnv):
     def get_number_of_agents(self):
         return self.env.get_number_of_agents()
 
+    # 20240220 modified  for the multi-agent functionality
     def get_env_info(self):
         info = {}
         info['action_space'] = self.env.action_space
         info['observation_space'] = self.env.observation_space
+        info['agents'] = self.env.num_agents   # NOTE: this is for .obs_base_shape in ExperienceBuffer
 
         if hasattr(self.env, "amp_observation_space"):
             info['amp_observation_space'] = self.env.amp_observation_space
