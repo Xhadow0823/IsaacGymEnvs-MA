@@ -26,14 +26,14 @@ class FrankaReachMA(VecTask):
         # allocate all buffers
         # then override the obs and rew buffer for multi-agent
         super().allocate_buffers()
-        self.obs_buf = torch.zeros((self.num_envs * self.num_agents, self.num_obs), 
-                                   device=self.device, dtype=torch.float)
-        self.rew_buf = torch.zeros(self.num_envs * self.num_agents, 
-                                   device=self.device, dtype=torch.float)
-        self.reset_buf = torch.ones(self.num_envs * self.num_agents, 
-                                    device=self.device, dtype=torch.long)
-        self.timeout_buf = torch.zeros(self.num_envs * self.num_agents, 
-                                       device=self.device, dtype=torch.long)
+        self.obs_buf      = torch.zeros((self.num_envs * self.num_agents, self.num_obs), 
+                                        device=self.device, dtype=torch.float)
+        self.rew_buf      = torch.zeros(self.num_envs * self.num_agents, 
+                                        device=self.device, dtype=torch.float)
+        self.reset_buf    = torch.ones(self.num_envs * self.num_agents, 
+                                        device=self.device, dtype=torch.long)
+        self.timeout_buf  = torch.zeros(self.num_envs * self.num_agents, 
+                                        device=self.device, dtype=torch.long)
         self.progress_buf = torch.zeros(self.num_envs * self.num_agents, 
                                         device=self.device, dtype=torch.long)
 
@@ -84,6 +84,7 @@ class FrankaReachMA(VecTask):
         '''網路輸出的 actions ，這個tensor 會在 pre_physics_step 中被設定，並前處理完再套用到actor上'''
         self._init_cubeA_state = None           # Initial state of cubeA for the current env
         ''' cubeA 的  初始 actor state (姿態) \ 
+        這是 root_state 的 partial view \ 
         (n_envs x 13)
         '''
         self._cubeA_state = None                # Current state of cubeA for the current env
@@ -445,28 +446,32 @@ class FrankaReachMA(VecTask):
 
         # Initialize indices
         # TODO: 確保這個 global indice 維度與內容可以正確對應到所有 actors
-        self._global_indices = torch.arange(self.num_envs * (3+self.num_agents), dtype=torch.int32,  # 0123 modified  remove cube so n_actors in a env is 4 now
-                                           device=self.device).view(self.num_envs, -1)
+        _num_actors = 3 + self.num_agents  # 一個 env 中有多少 actors
+        self._global_indices = torch.arange(self.num_envs * (_num_actors),  # 0123 modified  remove cube so n_actors in a env is 4 now
+                                            dtype=torch.int32, device=self.device).view(self.num_envs, -1)
 
     def _update_states(self):
-        """update the self.state"""
+        """update the self.state. Be called in ._refresh()"""
         self.states.update({
-            # Franka
-            "q": self._q[:, :],
-            "q_gripper": self._q[:, -2:],
+            # dof positions
+            "q": self._q[:, :],               # 關節位置啦(dof.pos)
+            "q_gripper": self._q[:, -2:],     # 夾爪關節位置(dof.pos)
+            # eef 姿態
             "eef_pos": self._eef_state[:, :3],
             "eef_quat": self._eef_state[:, 3:7],
             "eef_vel": self._eef_state[:, 7:],
             "eef_lf_pos": self._eef_lf_state[:, :3],
             "eef_rf_pos": self._eef_rf_state[:, :3],
-            # Cubes
+            # cube 姿態
             "cubeA_quat": self._cubeA_state[:, 3:7],
             "cubeA_pos": self._cubeA_state[:, :3],
+            # cube 與 eef 相對位置
             "cubeA_pos_relative": self._cubeA_state[:, :3] - self._eef_state[:, :3]
         })
 
     def _refresh(self):
-        """this is to update the self.state for compute_observations() """
+        """to update the self.state dict for compute_observations(). Be called in .__init__() and .compute_observation() """
+        # 更新 sim 中的資訊，以便後面讀取
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
@@ -477,15 +482,15 @@ class FrankaReachMA(VecTask):
         self._update_states()
 
     def compute_reward(self, actions):
-        # self.rew_buf[:], self.reset_buf[:] = compute_franka_reward(
-        #     self.reset_buf, self.progress_buf, self.actions, self.states, self.reward_settings, self.max_episode_length
-        # )  # change reset_buf to timeout_buf for testing
+        '''計算 reward 並儲存至 rew_buf 與 reset_buf '''
         self.rew_buf[:], self.reset_buf[:] = compute_franka_reward(
             self.timeout_buf, self.progress_buf, self.actions, self.states, self.reward_settings, self.max_episode_length
         )  # change reset_buf to timeout_buf for testing
         # NOTE: 目前將參數中的 reset_buf 改為 timeout_buf ，因為判斷 reset 條件目前僅有 timeout
 
+    # TODO: 這邊可以新增一個function去針對不同的agent回傳個別的obs(或部份obs)
     def compute_observations(self):
+        '''整理出要交給 NN 進行推論的 obs_buf'''
         # -> new obs spec:
         #   cubeA_quat: 4
         #   cubeA_pos: 3
@@ -505,8 +510,12 @@ class FrankaReachMA(VecTask):
 
     # NOTE: 目前 reset 機能因 buffer 大小的修改而失效中!! （請見本 function 最後面）
     def reset_idx(self, env_ids):
-        env_ids_int32 = env_ids.to(dtype=torch.int32)
+        '''依據所收到的 ids 去重製對應的 env \ 
+        注意：目前 env_ids 的規格待統一中... \ 
+        Be called in .post_physical_step()'''
+        env_ids_int32 = env_ids.to(dtype=torch.int32)  # this line is  deprecated by author
 
+        #   以下進入重製任務目標方塊的流程
         # Reset cubes, sampling cube B first, then A
         # if not self._i:
         # self._reset_init_cube_state(cube='B', env_ids=env_ids, check_valid=False)
@@ -517,12 +526,12 @@ class FrankaReachMA(VecTask):
         self._cubeA_state[env_ids] = self._init_cubeA_state[env_ids]
         # self._cubeB_state[env_ids] = self._init_cubeB_state[env_ids]
 
+        #   以下進入重製 agent 狀態的流程
         # Reset agent
         reset_noise = torch.rand((len(env_ids), 9), device=self.device)
         pos = tensor_clamp(
-            self.franka_default_dof_pos.unsqueeze(0) +
-            self.franka_dof_noise * 2.0 * (reset_noise - 0.5),
-            self.franka_dof_lower_limits.unsqueeze(0), self.franka_dof_upper_limits)
+            self.franka_default_dof_pos.unsqueeze(0) + self.franka_dof_noise * 2.0 * (reset_noise - 0.5),
+            self.franka_dof_lower_limits.unsqueeze(0), self.franka_dof_upper_limits)  # 為何這邊沒有 .unsequeeze() ???
 
         # Overwrite gripper init pos (no noise since these are always position controlled)
         pos[:, -2:] = self.franka_default_dof_pos[-2:]
@@ -531,16 +540,18 @@ class FrankaReachMA(VecTask):
         pos = torch.cat((pos, pos), 1)
 
         # Reset the internal obs accordingly
-        self._q[env_ids, :] = pos  # NOTE: something wrong  # (n_envs x (n_arms*9) ?
-        self._qd[env_ids, :] = torch.zeros_like(self._qd[env_ids])
+        self._q[env_ids, :] = pos    # NOTE: # (n_envs x (n_arms*9)
+        self._qd[env_ids, :] = torch.zeros_like(self._qd[env_ids])  # this is velocities of dofs
 
         # Set any position control to the current position, and any vel / effort control to be 0
         # NOTE: Task takes care of actually propagating these controls in sim using the SimActions API
         self._pos_control[env_ids, :] = pos
-        self._effort_control[env_ids, :] = torch.zeros_like(pos)
+        self._effort_control[env_ids, :] = torch.zeros_like(pos)  # actor 的受力重設為0
 
+
+        # TODO: 這邊是有關 global 問題的，待重新並易並修正
         # Deploy updates
-        multi_env_ids_int32 = self._global_indices[env_ids, 0].flatten()
+        multi_env_ids_int32 = self._global_indices[env_ids, 0].flatten()  # 0 是指拿到第一個 actor 也就是 第一個 franka
         multi_env_ids_cubes_int32 = self._global_indices[env_ids, 3].flatten()  # TODO: malfunction in multi-arm version
 
         self.gym.set_dof_position_target_tensor_indexed(self.sim,
@@ -551,21 +562,21 @@ class FrankaReachMA(VecTask):
                                                         gymtorch.unwrap_tensor(self._effort_control),
                                                         gymtorch.unwrap_tensor(multi_env_ids_int32),
                                                         len(multi_env_ids_int32))
-        self.gym.set_dof_state_tensor_indexed(self.sim,                                      # 設定 dof_state 是為了 _q 和 _qd (partial view of dof_state)
-                                              gymtorch.unwrap_tensor(self._dof_state),
+        self.gym.set_dof_state_tensor_indexed(self.sim,
+                                              gymtorch.unwrap_tensor(self._dof_state),  # 設定 dof_state 是因為剛剛有修改 _q 和 _qd (partial view of dof_state)
                                               gymtorch.unwrap_tensor(multi_env_ids_int32),
                                               len(multi_env_ids_int32))
 
         # Update cube states
         # multi_env_ids_cubes_int32 = self._global_indices[env_ids, 3].flatten()  # TODO: malfunction in multi-arm version
         self.gym.set_actor_root_state_tensor_indexed(self.sim, 
-                                                     gymtorch.unwrap_tensor(self._root_state),
+                                                     gymtorch.unwrap_tensor(self._root_state),  # 這邊是為了設定 cube(actor) 的 state
                                                      gymtorch.unwrap_tensor(multi_env_ids_cubes_int32), 
                                                      len(multi_env_ids_cubes_int32))
-        # original 
+        
         # self.progress_buf[env_ids] = 0
         # self.reset_buf[env_ids] = 0
-        # new, just for testing
+        # TODO: 此作法僅供測試用，待修正
         new_env_ids = torch.cat([env_ids, env_ids + 2], dim=0)
         self.progress_buf[new_env_ids] = 0
         self.reset_buf[new_env_ids] = 0
@@ -574,6 +585,7 @@ class FrankaReachMA(VecTask):
     # 0123 modified  remove cubeB
     def _reset_init_cube_state(self, cube, env_ids, check_valid=True):
         """
+        僅計算目標狀態，實際套用將在 reset_idx() \ 
         Simple method to sample @cube's position based on self.startPositionNoise and self.startRotationNoise, and
         automaticlly reset the pose internally. Populates the appropriate self._init_cubeX_state
 
@@ -647,6 +659,7 @@ class FrankaReachMA(VecTask):
         # Lastly, set these sampled values as the new init state
         this_cube_state_all[env_ids, :] = sampled_cube_state
 
+    # TODO: 這邊需要找時間搞懂這個演算法
     def _compute_osc_torques(self, dpose):
         """anti-hurt-self function, output size is (n, 7) no matter the dpose size"""
         # Solve for Operational Space Control # Paper: khatib.stanford.edu/publications/pdfs/Khatib_1987_RA.pdf
@@ -681,6 +694,7 @@ class FrankaReachMA(VecTask):
         """do preprocess of the actions from actor and send them into the simulation"""
         self.actions = actions.clone().to(self.device)
 
+        # TODO: 這邊可以拿來先測試之後要用的 get_agent_ids() function
         # Split arm and gripper command
         # u_arm, u_gripper = self.actions[:, :-1], self.actions[:, -1]
         u_arm = self.actions[:, :6]  # shape: (n_envs, 6) u_arn size is the same
