@@ -62,11 +62,12 @@ class FrankaReachMA(VecTask):
 
         # Controller type (deprecated)
         self.control_type = self.cfg["env"]["controlType"]
+        '''控制方式，已棄用，預設是osc'''
         assert self.control_type in {"osc", "joint_tor"},\
             "Invalid control type specified. Must be one of: {osc, joint_tor}"
 
         # dimensions
-        self.cfg["env"]["numObservations"] = 14  # 7 + 7 (pose of cube A and the eef pose)
+        self.cfg["env"]["numObservations"] = 14  # 7 + 7 (pose of cube A and the eef pose)  # TODO: 這個將會改變，會加入其他手臂的姿態資訊來學習避免碰撞
         self.cfg["env"]["numActions"] = 6        # 6 dof (no gripper)
 
         # Values to be filled in at runtime
@@ -119,9 +120,11 @@ class FrankaReachMA(VecTask):
         '''碰撞的 force 資訊，目前沒有用到'''
         self._eef_state = None  # end effector state (at grasping point)
         ''' 是 _rigid_body_state 的 partial view,  panda_grip_site 這個 rigid body 的 state \ 
+        (num_envs x 13)
         '''
         self._eef_lf_state = None  # end effector state (at left fingertip)
         ''' 是 _rigid_body_state 的 partial view \ 
+        (num_envs x 13)
         '''
         self._eef_rf_state = None  # end effector state (at left fingertip)
         ''' 是 _rigid_body_state 的 partial view \ 
@@ -170,6 +173,7 @@ class FrankaReachMA(VecTask):
         self.franka_default_dof_pos = to_torch(
             [0, 0.1963, 0, -2.6180, 0, 2.9416, 0.7854, 0.035, 0.035], device=self.device
         )
+        '''franka 手臂的預設 dof pos，維度是(9,)'''
 
         # OSC Gains
         self.kp = to_torch([150.] * 6, device=self.device)
@@ -180,7 +184,7 @@ class FrankaReachMA(VecTask):
 
         # Set control limits
         self.cmd_limit = to_torch([0.1, 0.1, 0.1, 0.5, 0.5, 0.5], device=self.device).unsqueeze(0) if \
-        self.control_type == "osc" else self._franka_effort_limits[:7].unsqueeze(0)
+                            self.control_type == "osc" else self._franka_effort_limits[:7].unsqueeze(0)
 
         # Reset all environments
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
@@ -329,7 +333,7 @@ class FrankaReachMA(VecTask):
             env_ptr = self.gym.create_env(self.sim, lower, upper, num_per_row)
 
             # Create actors and define aggregate group appropriately depending on setting
-            # NOTE: franka should ALWAYS be loaded first in sim! !!!!!!!!!!!!!!!!!!!!!!     # NOTE: this will be a big problem in building MA version
+            # NOTE: franka should ALWAYS be loaded first in sim! !!!!!!!!!!!!!!!!!!!!!!     # NOTE: this will be a problem in building MA version
             if self.aggregate_mode >= 3:
                 self.gym.begin_aggregate(env_ptr, max_agg_bodies, max_agg_shapes, True)
 
@@ -389,6 +393,7 @@ class FrankaReachMA(VecTask):
         # Setup data
         self.init_data()
 
+    # TODO: 這邊將要大改，handle 的內容是在這邊設定的
     def init_data(self):
         # Setup sim handles
         env_ptr = self.envs[0]
@@ -416,6 +421,8 @@ class FrankaReachMA(VecTask):
         self._rigid_body_state = gymtorch.wrap_tensor(_rigid_body_state_tensor).view(self.num_envs, -1, 13) # change into (n_envs, n_rigid_body of the env, 13)
         self._q = self._dof_state[..., 0]  # (n_envs, n_dof of the env)'s position
         self._qd = self._dof_state[..., 1]  # (n_envs, n_dof of the env)'s velocity
+
+        # TODO: 沒意外的話，這邊要改成每個手臂的
         self._eef_state = self._rigid_body_state[:, self.handles["grip_site"], :]
         self._eef_lf_state = self._rigid_body_state[:, self.handles["leftfinger_tip"], :]
         self._eef_rf_state = self._rigid_body_state[:, self.handles["rightfinger_tip"], :]
@@ -500,7 +507,7 @@ class FrankaReachMA(VecTask):
 
         self._refresh()
         obs = ["cubeA_quat", "cubeA_pos", "eef_quat", "eef_pos"]  # 14 obs version, better a lots
-        self.obs_buf = torch.cat([self.states[ob] for ob in obs], dim=-1)
+        self.obs_buf = torch.cat([self.states[ob] for ob in obs], dim=-1)  # TODO: obs 幾乎都是從 .state 來的，需要先定義新版的 state dict 
         # TODO: 將 obs_buf 中的內容確實對應到所有 agents 
         self.obs_buf = torch.cat([self.obs_buf, self.obs_buf], dim=0)  # this is for testing
 
@@ -511,8 +518,8 @@ class FrankaReachMA(VecTask):
     # NOTE: 目前 reset 機能因 buffer 大小的修改而失效中!! （請見本 function 最後面）
     def reset_idx(self, env_ids):
         '''依據所收到的 ids 去重製對應的 env \ 
-        注意：目前 env_ids 的規格待統一中... \ 
-        Be called in .post_physical_step()'''
+        注意：env_ids 就是所需要處理的 env 的 id \ 
+        will Be called in .post_physical_step()'''
         env_ids_int32 = env_ids.to(dtype=torch.int32)  # this line is  deprecated by author
 
         #   以下進入重製任務目標方塊的流程
@@ -526,15 +533,15 @@ class FrankaReachMA(VecTask):
         self._cubeA_state[env_ids] = self._init_cubeA_state[env_ids]
         # self._cubeB_state[env_ids] = self._init_cubeB_state[env_ids]
 
-        #   以下進入重製 agent 狀態的流程
+        #   以下進入重置 agent 狀態的流程
         # Reset agent
-        reset_noise = torch.rand((len(env_ids), 9), device=self.device)
+        reset_noise = torch.rand((len(env_ids), 9), device=self.device)  # 9 是因為 franka arm 有 9 個 dof
         pos = tensor_clamp(
             self.franka_default_dof_pos.unsqueeze(0) + self.franka_dof_noise * 2.0 * (reset_noise - 0.5),
             self.franka_dof_lower_limits.unsqueeze(0), self.franka_dof_upper_limits)  # 為何這邊沒有 .unsequeeze() ???
 
         # Overwrite gripper init pos (no noise since these are always position controlled)
-        pos[:, -2:] = self.franka_default_dof_pos[-2:]
+        pos[:, -2:] = self.franka_default_dof_pos[-2:]  # 不對夾爪加噪音
 
         # NOTE: pos size have to be change later
         pos = torch.cat((pos, pos), 1)
@@ -585,6 +592,7 @@ class FrankaReachMA(VecTask):
     # 0123 modified  remove cubeB
     def _reset_init_cube_state(self, cube, env_ids, check_valid=True):
         """
+        輸入需進行重置的 env ids \ 
         僅計算目標狀態，實際套用將在 reset_idx() \ 
         Simple method to sample @cube's position based on self.startPositionNoise and self.startRotationNoise, and
         automaticlly reset the pose internally. Populates the appropriate self._init_cubeX_state
