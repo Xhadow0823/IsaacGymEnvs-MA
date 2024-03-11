@@ -67,7 +67,7 @@ class FrankaReachMA(VecTask):
             "Invalid control type specified. Must be one of: {osc, joint_tor}"
 
         # dimensions
-        self.cfg["env"]["numObservations"] = 14  # 7 + 7 (pose of cube A and the eef pose)  # TODO: 這個將會改變，會加入其他手臂的姿態資訊來學習避免碰撞
+        self.cfg["env"]["numObservations"] = 14+3    # 7 + 7 (pose of cube A and the eef pose) 3 (cubeA_eef_relative)
         self.cfg["env"]["numActions"] = 6        # 6 dof (no gripper)
 
         # Values to be filled in at runtime
@@ -160,7 +160,8 @@ class FrankaReachMA(VecTask):
         '''所有的 env 的 所有 actor 的 indices，可以被用來作為 mask \ 
         (num_envs x num_actors_per_env), \ 
         ex: [[1 2 3][4 5 6]]
-        ''' # TODO: 因為這個 uuid 規則改變了，所以有用到這個 array的 buffer 很可能是壞掉的
+        ''' 
+        # TODO: 因為這個 uuid 規則改變了，所以有用到這個 array的 buffer 很可能是壞掉的，待確認
         
         self.debug_viz = self.cfg["env"]["enableDebugVis"]
 
@@ -397,8 +398,9 @@ class FrankaReachMA(VecTask):
             # ====================== OTHER ARMS =====================================
             # TODO: change this block into a for-loop
             franka_start_pose2 = gymapi.Transform()
-            franka_start_pose2.p = gymapi.Vec3(-0.45 + 0.6, 0.0 + 0.6, 1.0 + table_thickness / 2 + table_stand_height)
-            franka_start_pose2.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
+            franka_start_pose2.p = gymapi.Vec3(-0.45 + 0.6, 0.0 + 0.6, 1.0 + table_thickness / 2 + table_stand_height)  # 這邊手動轉向-90度(z)
+            # franka_start_pose2.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
+            franka_start_pose2.r = gymapi.Quat(0.0, 0.0, -0.7071068, 0.7071068)
             franka_actor2 = self.gym.create_actor(env_ptr, franka_asset, franka_start_pose2, "franka2", i, 2, 0)  # test
             self.gym.set_actor_dof_properties(env_ptr, franka_actor2, franka_dof_props)
             self.frankas[i].append(franka_actor2)
@@ -410,7 +412,6 @@ class FrankaReachMA(VecTask):
         # Setup data
         self.init_data()
 
-    # TODO: 這邊將要大改，handle 的內容是在這邊設定的
     def init_data(self):
         # Setup sim handles
         env_ptr = self.envs[0]
@@ -418,7 +419,8 @@ class FrankaReachMA(VecTask):
 
         self.handles = {
             # Franka
-            # TODO: 注意！！這邊的 handle 將不是用引用的，不能直接對應到原本值的變動！！！！
+            "base":             [self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle_i, "panda_link0") for franka_handle_i in self.frankas[0]],
+            # TODO: 注意！！這邊的 handle 將不是用引用的，不能直接對應到原本值的變動！！！！ 待確認需求
             "hand":             [self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle_i, "panda_hand") for franka_handle_i in self.frankas[0]],
             "leftfinger_tip":   [self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle_i, "panda_leftfinger_tip") for franka_handle_i in self.frankas[0]],
             "rightfinger_tip":  [self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle_i, "panda_rightfinger_tip") for franka_handle_i in self.frankas[0]],
@@ -441,21 +443,27 @@ class FrankaReachMA(VecTask):
         self._q = self._dof_state[..., 0]  # (n_envs, n_dof of the env)'s position
         self._qd = self._dof_state[..., 1]  # (n_envs, n_dof of the env)'s velocity
 
-        # TODO: 這個方式需要調整的更零活一些！！
-        # self._eef_state = self._rigid_body_state[:, self.handles["grip_site"], :]   # TODO: 這樣雖然可以拿到一開始的資料，但是這樣 不 是 reference 的方式，會讓後面追蹤不到 observation !!!
+        # self._eef_state = self._rigid_body_state[:, self.handles["grip_site"], :]   # NOTE: 這樣雖然可以拿到一開始的資料，但是這樣 不 是 reference 的方式，會讓後面追蹤不到 observation !!!
         _grip_start_idx = self.handles["grip_site"][0]
         _grip_step = self.handles["grip_site"][1] - self.handles["grip_site"][0]
         self._eef_state = self._rigid_body_state[:, _grip_start_idx::_grip_step, :]
 
+        _base_start_idx = self.handles["base"][0]
+        _base_step = self.handles["base"][1] - self.handles["base"][0]
+        self._base_state = self._rigid_body_state[:, _base_start_idx::_base_step, :]  # 新增一組_base_state來追蹤姿態以供obs系統使用
+
         self._eef_lf_state = self._rigid_body_state[:, self.handles["leftfinger_tip"], :]  # TODO: this not works!!
         self._eef_rf_state = self._rigid_body_state[:, self.handles["rightfinger_tip"], :] # TODO: this not works!!
-        _jacobian = self.gym.acquire_jacobian_tensor(self.sim, "franka")
-        jacobian = gymtorch.wrap_tensor(_jacobian)  # (n_envs, joints, ?, ?)
-        hand_joint_index = self.gym.get_actor_joint_dict(env_ptr, franka_handle)['panda_hand_joint']
-        self._j_eef = jacobian[:, hand_joint_index, :, :7]   # why
-        _massmatrix = self.gym.acquire_mass_matrix_tensor(self.sim, "franka")
-        mm = gymtorch.wrap_tensor(_massmatrix)
-        self._mm = mm[:, :7, :7]
+        
+        # _jacobian = self.gym.acquire_jacobian_tensor(self.sim, "franka")  # (n_envs, joints, 6, 9)  # NOTE: deprecated, 改用 _get_j_eef()
+        # jacobian = gymtorch.wrap_tensor(_jacobian)
+        # hand_joint_index = self.gym.get_actor_joint_dict(env_ptr, franka_handle)['panda_hand_joint']  # =7
+        # self._j_eef = jacobian[:, hand_joint_index, :, :7]   # (num_envs x 6 x 7)  # 這邊有點問題 因為只有拿到第一agent的
+        
+        # _massmatrix = self.gym.acquire_mass_matrix_tensor(self.sim, "franka")  # (num_envs x 9 x 9)  # NOTE: deprecated, 改用 _get_mm()
+        # mm = gymtorch.wrap_tensor(_massmatrix)
+        # self._mm = mm[:, :7, :7]
+
         self._cubeA_state = self._root_state[:, self._cubeA_id, :]
         # self._cubeB_state = self._root_state[:, self._cubeB_id, :]
 
@@ -468,8 +476,8 @@ class FrankaReachMA(VecTask):
 
         # Initialize actions
         # these 2 properties are used to set the actor states in the simulation (in self.pre_physics_step())
-        self._pos_control = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)  # TODO: change dimension
-        self._effort_control = torch.zeros_like(self._pos_control)  # TODO: change dimension
+        self._pos_control = torch.zeros((self.num_envs, self.num_dofs), dtype=torch.float, device=self.device)
+        self._effort_control = torch.zeros_like(self._pos_control)
 
         # Initialize control
         # 選取0:0+7, 9:9+7 ... ，改成9個一排，選前7個。  維度變成 ((num_envs*num_agents) x 7)
@@ -480,29 +488,31 @@ class FrankaReachMA(VecTask):
         # Initialize indices
         # TODO: 確保這個 global indice 維度與內容可以正確對應到所有 actors
         _num_actors = 3 + self.num_agents  # 一個 env 中有多少 actors
-        self._global_indices = torch.arange(self.num_envs * (_num_actors),  # 0123 modified  remove cube so n_actors in a env is 4 now
-                                            dtype=torch.int32, device=self.device).view(self.num_envs, -1)
+        self._global_indices = torch.arange((self.num_envs*_num_actors), dtype=torch.int32, device=self.device).view(self.num_envs, -1) # 0123 modified  remove cube so n_actors in a env is 4 now
 
     # TODO: 注意這邊有些維度是 ((num_envs*num_agents) x m); 有些是(num_envs x num_agents x m)，要確認是否需要在這邊統一或是自行使用 .view() 修改
     def _update_states(self):
         """update the self.state. Be called in ._refresh()"""
-        agent_ids = list(range(self.num_agents))
+        agent_ids = list(range(self.num_agents))  # TODO: 好像現在不需要這樣做誒，移除這個
         self.states.update({
             # dof positions
             "q": self._q[:, :],               # 所有關節位置(dof.pos)
             "q_gripper": self._q[:, -2:],     # 夾爪關節位置(dof.pos)
             # eef 姿態
-            "eef_pos": self._eef_state[:, agent_ids, :3],
-            "eef_quat": self._eef_state[:, agent_ids, 3:7],
-            "eef_vel": self._eef_state[:, agent_ids, 7:],  # NOTE: 這邊維度有變動，故 ocs 計算有用到要注意
-            "eef_lf_pos": self._eef_lf_state[:, agent_ids, :3],
-            "eef_rf_pos": self._eef_rf_state[:, agent_ids, :3],
+            "eef_pos": self._eef_state[:, :, :3],
+            "eef_quat": self._eef_state[:, :, 3:7],
+            "eef_vel": self._eef_state[:, :, 7:],  # NOTE: 這邊維度有變動，故 ocs 計算有用到要注意
+            "eef_lf_pos": self._eef_lf_state[:, :, :3],
+            "eef_rf_pos": self._eef_rf_state[:, :, :3],
             # cube 姿態
             "cubeA_quat": self._cubeA_state[:, 3:7].repeat_interleave(self.num_agents, dim=0),
             "cubeA_pos": self._cubeA_state[:, :3].repeat_interleave(self.num_agents, dim=0),   # 這邊從 1 2 變成 1 1 2 2
             # cube 與 eef 相對位置
-            "cubeA_pos_relative": self._cubeA_state[:, :3].unsqueeze(1).repeat_interleave(self.num_agents, dim=1) - self._eef_state[:, agent_ids, :3]  # TODO: 暫時僅計算第一agent
+            "cubeA_pos_relative": self._cubeA_state[:, :3].unsqueeze(1).repeat_interleave(self.num_agents, dim=1) - self._eef_state[:, :, :3],
             #                              2 x (2 x 3)  -  2 x (2 x 3)
+            # 新增一個基座姿態
+            "base_pos": self._base_state[:, :, :3],
+            "base_quat": self._base_state[:, :, 3:7]
         })
 
     def _refresh(self):
@@ -523,33 +533,34 @@ class FrankaReachMA(VecTask):
             self.reset_buf, self.progress_buf, self.actions, self.states, self.reward_settings, self.max_episode_length
         )
 
-    # TODO: 這邊可以新增一個function去針對不同的agent回傳個別的obs(或部份obs)
-    # TODO: ERROR ERRORERRORERRORERRORERRORERRORERRORERROR 這邊的 state 引用方式有誤，皆收到無意義obs導致網路不收斂 ERRORERRORERRORERRORERRORERROR
     def compute_observations(self):
         '''整理出要交給 NN 進行推論的 obs_buf'''
-        # -> new obs spec:
-        #   cubeA_quat: 4
-        #   cubeA_pos: 3
-        #   eef_quat: 4
-        #   eef_pos: 3
-        # total size: 14
+        # cubeA_quat: 4
+        # cubeA_pos: 3
+        # eef_quat: 4
+        # eef_pos: 3
+        # base_pos: 3
+        # base_quat: 4
+        # cubeA_pos_relative: 3  # this is IMPORTANT for maulti-arm system
 
         self._refresh()
-        obs = ["cubeA_quat", "cubeA_pos", "eef_quat", "eef_pos"]  # 14 obs version, better a lots
-        self.obs_buf = torch.cat([self.states[ob].view(self.num_envs * self.num_agents, -1) for ob in obs], dim=-1)  # TODO: obs 幾乎都是從 .state 來的，需要先定義新版的 state dict 
-        # TODO: 將 obs_buf 中的內容確實對應到所有 agents 
+        # obs = ["cubeA_quat", "cubeA_pos", "eef_quat", "eef_pos",   "base_pos", "base_quat", "cubeA_pos_relative"]  # 14+7+3
+        obs = ["cubeA_quat", "cubeA_pos", "eef_quat", "eef_pos", "cubeA_pos_relative"]  # 14+3 obs   # without base, GOOD
+        # obs = ["cubeA_pos_relative"]  # 3 obs   # only relative information
+        self.obs_buf = torch.cat([self.states[ob].contiguous().view(self.num_envs * self.num_agents, -1) for ob in obs], dim=-1)  # TODO: obs 幾乎都是從 .state 來的，需要先定義新版的 state dict 
         
         # maxs = {ob: torch.max(self.states[ob]).item() for ob in obs}  # unused gy author
 
         return self.obs_buf
 
     # NOTE: 因應大多數 buffer 都改成 num_envs * num_agents 的大小，故我們將 reset_idx 接收的參數也改成 agent_ids
+    # TODO: 這邊改動很多，目前流程很亂，待整理！！
     def reset_idx(self, agent_ids):
         '''依據所收到的 agent 的 ids 去重製對應的 env \ 
         注意：env_ids 是所需要處理的 env 的 ids, 這邊接收的是與 reset_buf 和 timeout_buf 格式的 agent_ids \ 
-        this will Be called in .post_physical_step() and init()'''
+        this will be called in .post_physical_step() and init()'''
         # env_ids_int32 = env_ids.to(dtype=torch.int32)  # this line is  deprecated by author
-        env_ids = self._agent_ids_to_env_ids(agent_ids, use_AND_filter=True)  #ERROR#ERROR#ERROR#ERROR#ERROR#ERROR
+        env_ids = self._agent_ids_to_env_ids(agent_ids, use_AND_filter=True) # 這邊有做 AND 的過濾
 
         #   以下進入重製任務目標方塊的流程
         # Reset cubes, sampling cube B first, then A
@@ -610,15 +621,12 @@ class FrankaReachMA(VecTask):
                                                      gymtorch.unwrap_tensor(multi_env_ids_cubes_int32), 
                                                      len(multi_env_ids_cubes_int32))
         
-        # self.progress_buf[env_ids] = 0
-        # self.reset_buf[env_ids] = 0
-        # TODO: 此作法僅供測試用，待修正
-        new_agent_ids = self._env_ids_to_agent_ids(env_ids)
+        new_agent_ids = self._env_ids_to_agent_ids(env_ids)  # env_ids 是指定要 reset 的 env，這邊轉換成 agent的ids
         self.progress_buf[new_agent_ids] = 0
         self.reset_buf[new_agent_ids] = 0
-        # TODO: 這邊要考慮是否要將 env_ids 維度改為 num_envs x num_agents，並改變 reset cube state 接收的 env_ids 讀取規則
 
     # 0123 modified  remove cubeB
+    # TODO: 這邊在改為multi-arm架構後，就一直沒有修改，待調整
     def _reset_init_cube_state(self, cube, env_ids, check_valid=True):
         """
         輸入需進行重置的 env ids \ 
@@ -696,29 +704,33 @@ class FrankaReachMA(VecTask):
         # Lastly, set these sampled values as the new init state
         this_cube_state_all[env_ids, :] = sampled_cube_state
 
-    # TODO: 這邊需要找時間搞懂這個演算法
     def _compute_osc_torques(self, dpose):
-        """anti-hurt-self function, output size is (n, 7) no matter the dpose size"""
+        """transform function, output size is (n, 7) no matter the dpose size"""
         # Solve for Operational Space Control # Paper: khatib.stanford.edu/publications/pdfs/Khatib_1987_RA.pdf
         # Helpful resource: studywolf.wordpress.com/2013/09/17/robot-control-4-operation-space-control/
-        q, qd = self._q[:, :7], self._qd[:, :7]
-        mm_inv = torch.inverse(self._mm)
-        m_eef_inv = self._j_eef @ mm_inv @ torch.transpose(self._j_eef, 1, 2)
+
+        _mm = self._get_mm()
+        _j_eef = self._get_j_eef()
+
+        # q, qd = self._q[:, :7], self._qd[:, :7]
+        q, qd = self._q.view(self.num_envs*self.num_agents, -1)[:, :7], self._qd.view(self.num_envs*self.num_agents, -1)[:, :7]
+        mm_inv = torch.inverse(_mm)
+        m_eef_inv = _j_eef @ mm_inv @ torch.transpose(_j_eef, 1, 2)
         m_eef = torch.inverse(m_eef_inv)
+        eef_vel = self.states["eef_vel"].reshape(self.num_envs*self.num_agents, -1)  # reshape from 2 x 2 x -1 to 4 x -1
 
         # Transform our cartesian action `dpose` into joint torques `u`
-        u = torch.transpose(self._j_eef, 1, 2) @ m_eef @ (
-                self.kp * dpose - self.kd * self.states["eef_vel"]).unsqueeze(-1)
+        u = torch.transpose(_j_eef, 1, 2) @ m_eef @ (self.kp * dpose - self.kd * eef_vel).unsqueeze(-1)
 
         # Nullspace control torques `u_null` prevents large changes in joint configuration
         # They are added into the nullspace of OSC so that the end effector orientation remains constant
         # roboticsproceedings.org/rss07/p31.pdf
-        j_eef_inv = m_eef @ self._j_eef @ mm_inv
-        u_null = self.kd_null * -qd + self.kp_null * (
-                (self.franka_default_dof_pos[:7] - q + np.pi) % (2 * np.pi) - np.pi)
+        j_eef_inv = m_eef @ _j_eef @ mm_inv
+        
+        u_null = self.kd_null * -qd + self.kp_null * ((self.franka_default_dof_pos[:7] - q + np.pi) % (2 * np.pi) - np.pi)
         u_null[:, 7:] *= 0
-        u_null = self._mm @ u_null.unsqueeze(-1)
-        u += (torch.eye(7, device=self.device).unsqueeze(0) - torch.transpose(self._j_eef, 1, 2) @ j_eef_inv) @ u_null
+        u_null = _mm @ u_null.unsqueeze(-1)
+        u += (torch.eye(7, device=self.device).unsqueeze(0) - torch.transpose(_j_eef, 1, 2) @ j_eef_inv) @ u_null
 
         # Clip the values to be within valid effort range
         u = tensor_clamp(u.squeeze(-1),
@@ -726,30 +738,25 @@ class FrankaReachMA(VecTask):
 
         return u
 
-    # TODO: 這邊是負責將經 NN 推理出的 actions 套用到 agents 上，流程待設計（目前流程無實際機能，僅供測試）
     def pre_physics_step(self, actions):
         """do preprocess of the actions from actor and send them into the simulation"""
         self.actions = actions.clone().to(self.device)
 
-        # TODO: 這邊可以拿來先測試之後要用的 get_agent_ids() function
         # Split arm and gripper command
         # u_arm, u_gripper = self.actions[:, :-1], self.actions[:, -1]
         u_arm = self.actions[:, :6]  # shape: (n_envs, 6) u_arn size is the same
-        # u_arm = u_arm[:2, :]  # NOTE: this is for testing !!!!!!!!
 
         u_arm = u_arm * self.cmd_limit / self.action_scale
         if self.control_type == "osc":
-            # u_arm = self._compute_osc_torques(dpose=u_arm)  # NOTE: this is for anti-hurt-self function
+            u_arm = self._compute_osc_torques(dpose=u_arm)  # NOTE: this is to transform two poses to torques
             pass
 
-        self._arm_control[:, :6] = u_arm
+        self._arm_control[:, :6] = u_arm[:, :6]
 
         self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self._effort_control))
 
     def post_physics_step(self):
         self.progress_buf += 1
-
-        # print(self.progress_buf[0])
 
         env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(env_ids) > 0:
@@ -757,19 +764,17 @@ class FrankaReachMA(VecTask):
 
         self.compute_observations()
         self.compute_reward(self.actions)
-
-        # 0123 modified  remove cubeB
-        # TODO: just removed the cubeB, not test this block yet
+        
         # debug viz
         if self.viewer and self.debug_viz:
             self.gym.clear_lines(self.viewer)
             self.gym.refresh_rigid_body_state_tensor(self.sim)
 
             # Grab relevant states to visualize
-            eef_pos = self.states["eef_pos"]
-            eef_rot = self.states["eef_quat"]
-            cubeA_pos = self.states["cubeA_pos"]
-            cubeA_rot = self.states["cubeA_quat"]
+            eef_pos = self.states["eef_pos"][:, 0, :]  # TODO: 現在先用第一手臂做測試，待修正
+            eef_rot = self.states["eef_quat"][:, 0, :]
+            cubeA_pos = self.states["cubeA_pos"][::2, :]
+            cubeA_rot = self.states["cubeA_quat"][::2, :]
             # cubeB_pos = self.states["cubeB_pos"]
             # cubeB_rot = self.states["cubeB_quat"]
 
@@ -802,13 +807,35 @@ class FrankaReachMA(VecTask):
         '''輸入[0 2] 輸出 [[0 1], [4 5]], 當num_agents=2'''
         agent_ids = torch.tensor( [list(range(2*i, 2*i+self.num_agents)) for i in env_ids] )
         return agent_ids
+    
+    def _get_j_eef(self):
+        j_eef_all_agents = []
+        for i in ['', '2']:  # TODO: 這個方式待調調整
+            _jacobian = self.gym.acquire_jacobian_tensor(self.sim, f"franka{i}")
+            jacobian = gymtorch.wrap_tensor(_jacobian)
+            hand_joint_index = self.gym.get_actor_joint_dict(self.envs[0], self.frankas[0][0])['panda_hand_joint']  # =7
+            j_eef = jacobian[:, hand_joint_index, :, :7]
+            if j_eef.sum() == 0:
+                self.gym.refresh_jacobian_tensors(self.sim)  # 這邊很重要，在剛開始運作時會出現尚未refresh就使用導致inverse()失敗
+            j_eef_all_agents.append(j_eef)
+        return torch.stack(j_eef_all_agents, dim=1).view(self.num_envs*self.num_agents, 6, 7)
+
+    def _get_mm(self):
+        mm_all_agents = []
+        for i in ['', '2']:  # TODO: 這個方式待調調整
+            _massmatrix = self.gym.acquire_mass_matrix_tensor(self.sim, f"franka{i}")
+            mm = gymtorch.wrap_tensor(_massmatrix)
+            if mm.sum() == 0:
+                self.gym.refresh_mass_matrix_tensors(self.sim)
+            mm_all_agents.append( mm[:, :7, :7] )
+        return torch.stack(mm_all_agents, dim=1).view(self.num_envs*self.num_agents, 7, 7)
+
+
 #####################################################################
 ###=========================jit functions=========================###
 #####################################################################
 
 
-# TODO: 這邊除了第一個維度有變動，後面幾個維度對舊的演算法沒有太大影響。將來要加上與團體有關的 reward 可以建立新 function 並修改這裡。
-# TODO: 應為第一個維度修改了，所以我們需要針對多個 agents 去計算其 reward，目前僅計算第一個 agent 的獎勵，待修正。
 @torch.jit.script
 def compute_franka_reward(
     reset_buf, progress_buf, actions, states, reward_settings, max_episode_length
@@ -817,15 +844,15 @@ def compute_franka_reward(
 
     # distance from hand to the cubeA
     d = torch.norm(states["cubeA_pos_relative"].view(-1, 3), dim=-1)
+
     # version 9
-    dist_reward = 1.0 / (1.0 + d * d)
+    a = 0.5  # 1 or 0.5 , 0.5 is better
+    dist_reward = 1.0 / (a + d * d)
     actions_cost = torch.sum(actions ** 2, dim=-1) * 0.01
     rewards = dist_reward - actions_cost
     rewards = torch.clip(rewards, 0., None)
 
     # Compute resets
     reset_buf = torch.where((progress_buf >= max_episode_length - 1), torch.ones_like(reset_buf), reset_buf)
-
-    # rewards = torch.cat([rewards, rewards], dim=0)  # this is for testing !!!  we needs 4 x n reward format
 
     return rewards, reset_buf

@@ -1,6 +1,43 @@
 import torch
 from torch import Tensor
 
+
+A = torch.arange(3*6*7).view(3, 6, 7)
+B = torch.arange(3*6*7).view(3, 6, 7) + (3*6*7)
+
+print(A)
+print(B)
+
+print(A.shape)
+print(B.shape)
+
+C = torch.stack([A, B], dim=1).view(3*2, 6, 7)
+print(C)
+print(C.shape)
+
+
+exit()
+
+
+num_agents = 2
+B = torch.arange(2 * 3).view(2, 3).repeat_interleave(num_agents, dim=0)
+print(B)
+
+exit()
+
+
+A = torch.arange(6).view(2, 3)
+print(A)
+B = torch.eye(2, 3).to(dtype=torch.long)
+print(B)
+
+print(A * B)  # pair-wise mul
+
+print(A.T @ B)  # matrix mul
+
+exit()
+
+
 dofs = torch.arange(2*35).view(2, 35)
 print(dofs)
 

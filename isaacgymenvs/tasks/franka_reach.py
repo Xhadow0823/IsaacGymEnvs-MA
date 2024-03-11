@@ -665,7 +665,7 @@ class FrankaReach(VecTask):
         # Control arm (scale value first)
         u_arm = u_arm * self.cmd_limit / self.action_scale
         if self.control_type == "osc":
-            u_arm = self._compute_osc_torques(dpose=u_arm)  # NOTE: this is for anti-hurt-self function
+            u_arm = self._compute_osc_torques(dpose=u_arm)  # NOTE: this is for osc , 這很重要，拿掉會跟喝醉一樣 =_=
             pass
         
         self._arm_control[:, :6] = u_arm[:, :6]
