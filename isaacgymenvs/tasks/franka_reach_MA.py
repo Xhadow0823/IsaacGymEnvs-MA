@@ -202,7 +202,7 @@ class FrankaReachMA(VecTask):
                             self.control_type == "osc" else self._franka_effort_limits[:7].unsqueeze(0)
 
         # Reset all environments
-        self.reset_idx(torch.arange(self.num_envs, device=self.device))
+        self.reset_idx(torch.arange(self.num_envs*self.num_agents, device=self.device))
 
         # Refresh tensors
         self._refresh()
@@ -348,35 +348,16 @@ class FrankaReachMA(VecTask):
             env_ptr = self.gym.create_env(self.sim, lower, upper, num_per_row)
 
             # Create actors and define aggregate group appropriately depending on setting
-            # NOTE: franka should ALWAYS be loaded first in sim! !!!!!!!!!!!!!!!!!!!!!!     # NOTE: this will be a problem in building MA version
-            if self.aggregate_mode >= 3:
-                self.gym.begin_aggregate(env_ptr, max_agg_bodies, max_agg_shapes, True)
-
-            # Create franka
-            # Potentially randomize start pose
-            if self.franka_position_noise > 0:
-                rand_xy = self.franka_position_noise * (-1. + np.random.rand(2) * 2.0)
-                franka_start_pose.p = gymapi.Vec3(-0.45 + rand_xy[0], 0.0 + rand_xy[1],
-                                                 1.0 + table_thickness / 2 + table_stand_height)
-            if self.franka_rotation_noise > 0:
-                rand_rot = torch.zeros(1, 3)
-                rand_rot[:, -1] = self.franka_rotation_noise * (-1. + np.random.rand() * 2.0)
-                new_quat = axisangle2quat(rand_rot).squeeze().numpy().tolist()
-                franka_start_pose.r = gymapi.Quat(*new_quat)
-            franka_actor = self.gym.create_actor(env_ptr, franka_asset, franka_start_pose, "franka", i, 2, 0)  # modified 0122  change the franka's collision mask
-            self.gym.set_actor_dof_properties(env_ptr, franka_actor, franka_dof_props)
-
-            if self.aggregate_mode == 2:
-                self.gym.begin_aggregate(env_ptr, max_agg_bodies, max_agg_shapes, True)
+            # if self.aggregate_mode >= 3:
+            #     self.gym.begin_aggregate(env_ptr, max_agg_bodies, max_agg_shapes, True)
 
             # Create table
             table_actor = self.gym.create_actor(env_ptr, table_asset, table_start_pose, "table", i, 1, 0)
             table_stand_actor = self.gym.create_actor(env_ptr, table_stand_asset, table_stand_start_pose, "table_stand",
                                                       i, 1, 0)
 
-            if self.aggregate_mode == 1:
-                self.gym.begin_aggregate(env_ptr, max_agg_bodies, max_agg_shapes, True)
-
+            # if self.aggregate_mode == 2:
+            #     self.gym.begin_aggregate(env_ptr, max_agg_bodies, max_agg_shapes, True)
 
             # Create cubes
             self._cubeA_id = self.gym.create_actor(env_ptr, cubeA_asset, cubeA_start_pose, "cubeA", i, 2, 0)  # modified 0122  change the franka's collision mask
@@ -385,25 +366,41 @@ class FrankaReachMA(VecTask):
             self.gym.set_rigid_body_color(env_ptr, self._cubeA_id, 0, gymapi.MESH_VISUAL, cubeA_color)
             # self.gym.set_rigid_body_color(env_ptr, self._cubeB_id, 0, gymapi.MESH_VISUAL, cubeB_color)
 
+            # if self.aggregate_mode == 1:
+            #     self.gym.begin_aggregate(env_ptr, max_agg_bodies, max_agg_shapes, True)
 
-
-            if self.aggregate_mode > 0:
-                self.gym.end_aggregate(env_ptr)
-
+            # if self.aggregate_mode > 0:
+            #     self.gym.end_aggregate(env_ptr)
+            
             # Store the created env pointers
             self.envs.append(env_ptr)
-            self.frankas.append(list())
-            self.frankas[i].append(franka_actor)
+            self.frankas.append(list())  # this is handle list for every env
 
-            # ====================== OTHER ARMS =====================================
-            # TODO: change this block into a for-loop
-            franka_start_pose2 = gymapi.Transform()
-            franka_start_pose2.p = gymapi.Vec3(-0.45 + 0.6, 0.0 + 0.6, 1.0 + table_thickness / 2 + table_stand_height)  # 這邊手動轉向-90度(z)
-            # franka_start_pose2.r = gymapi.Quat(0.0, 0.0, 0.0, 1.0)
-            franka_start_pose2.r = gymapi.Quat(0.0, 0.0, -0.7071068, 0.7071068)
-            franka_actor2 = self.gym.create_actor(env_ptr, franka_asset, franka_start_pose2, "franka2", i, 2, 0)  # test
-            self.gym.set_actor_dof_properties(env_ptr, franka_actor2, franka_dof_props)
-            self.frankas[i].append(franka_actor2)
+            # Create franka
+            # Potentially randomize start pose
+            # TODO: NOT IMPLEMENT YET
+            if self.franka_position_noise > 0:
+                raise NotImplementedError()
+                rand_xy = self.franka_position_noise * (-1. + np.random.rand(2) * 2.0)
+                franka_start_pose.p = gymapi.Vec3(-0.45 + rand_xy[0], 0.0 + rand_xy[1], 1.0 + table_thickness / 2 + table_stand_height)
+            if self.franka_rotation_noise > 0:
+                raise NotImplementedError()
+                rand_rot = torch.zeros(1, 3)
+                rand_rot[:, -1] = self.franka_rotation_noise * (-1. + np.random.rand() * 2.0)
+                new_quat = axisangle2quat(rand_rot).squeeze().numpy().tolist()
+                franka_start_pose.r = gymapi.Quat(*new_quat)
+
+            # ====================== CREATE ARMS =====================================
+            franka_start_pose = gymapi.Transform()
+            franka_start_z = 1.0 + table_thickness / 2 + table_stand_height
+            _p, _r = self._get_franka_start_poses_rots(r=0.45)
+
+            for franka_idx in range(1, self.num_agents+1):
+                franka_start_pose.p = gymapi.Vec3(*_p[franka_idx-1], franka_start_z)
+                franka_start_pose.r = gymapi.Quat(*_r[franka_idx-1])
+                franka_actor = self.gym.create_actor(env_ptr, franka_asset, franka_start_pose, f"franka{franka_idx}", i, 2, 0)
+                self.gym.set_actor_dof_properties(env_ptr, franka_actor, franka_dof_props)
+                self.frankas[i].append(franka_actor)
 
         # Setup init state buffer
         self._init_cubeA_state = torch.zeros(self.num_envs, 13, device=self.device)
@@ -599,7 +596,7 @@ class FrankaReachMA(VecTask):
         agent_actor_ids = self.frankas[0]
         # Deploy updates
         multi_env_ids_int32 = self._global_indices[env_ids, :][:, agent_actor_ids].flatten()  # 0 是指拿到第一個 actor 也就是 第一個 franka  
-        multi_env_ids_cubes_int32 = self._global_indices[env_ids, 3].flatten()  # TODO: malfunction in multi-arm version
+        multi_env_ids_cubes_int32 = self._global_indices[env_ids, self._cubeA_id].flatten()  # TODO: malfunction in multi-arm version
 
         self.gym.set_dof_position_target_tensor_indexed(self.sim,
                                                         gymtorch.unwrap_tensor(self._pos_control),
@@ -694,6 +691,7 @@ class FrankaReachMA(VecTask):
             sampled_cube_state[:, :2] = centered_cube_xy_state.unsqueeze(0) + \
                                               2.0 * self.start_position_noise * (
                                                       torch.rand(num_resets, 2, device=self.device) - 0.5)
+            # sampled_cube_state[:, :2] = centered_cube_xy_state.unsqueeze(0)  # NOTE: THIS LINE IS FOR TESTING
 
         # Sample rotation value
         if self.start_rotation_noise > 0:
@@ -773,8 +771,8 @@ class FrankaReachMA(VecTask):
             # Grab relevant states to visualize
             eef_pos = self.states["eef_pos"][:, 0, :]  # TODO: 現在先用第一手臂做測試，待修正
             eef_rot = self.states["eef_quat"][:, 0, :]
-            cubeA_pos = self.states["cubeA_pos"][::2, :]
-            cubeA_rot = self.states["cubeA_quat"][::2, :]
+            cubeA_pos = self.states["cubeA_pos"][::self.num_agents, :]
+            cubeA_rot = self.states["cubeA_quat"][::self.num_agents, :]
             # cubeB_pos = self.states["cubeB_pos"]
             # cubeB_rot = self.states["cubeB_quat"]
 
@@ -805,12 +803,11 @@ class FrankaReachMA(VecTask):
         
     def _env_ids_to_agent_ids(self, env_ids):
         '''輸入[0 2] 輸出 [[0 1], [4 5]], 當num_agents=2'''
-        agent_ids = torch.tensor( [list(range(2*i, 2*i+self.num_agents)) for i in env_ids] )
-        return agent_ids
+        return torch.arange(self.num_envs*self.num_agents).view(self.num_envs, self.num_agents)[env_ids, :].flatten()
     
     def _get_j_eef(self):
         j_eef_all_agents = []
-        for i in ['', '2']:  # TODO: 這個方式待調調整
+        for i in range(1, self.num_agents+1):
             _jacobian = self.gym.acquire_jacobian_tensor(self.sim, f"franka{i}")
             jacobian = gymtorch.wrap_tensor(_jacobian)
             hand_joint_index = self.gym.get_actor_joint_dict(self.envs[0], self.frankas[0][0])['panda_hand_joint']  # =7
@@ -822,13 +819,22 @@ class FrankaReachMA(VecTask):
 
     def _get_mm(self):
         mm_all_agents = []
-        for i in ['', '2']:  # TODO: 這個方式待調調整
+        for i in range(1, self.num_agents+1):
             _massmatrix = self.gym.acquire_mass_matrix_tensor(self.sim, f"franka{i}")
             mm = gymtorch.wrap_tensor(_massmatrix)
             if mm.sum() == 0:
                 self.gym.refresh_mass_matrix_tensors(self.sim)
             mm_all_agents.append( mm[:, :7, :7] )
         return torch.stack(mm_all_agents, dim=1).view(self.num_envs*self.num_agents, 7, 7)
+    def _get_franka_start_poses_rots(self, r):
+        '''輸入分佈的圓之半徑, 輸出agents的位置和繞z軸旋轉四元素'''
+        rads = torch.deg2rad(
+            torch.tensor(range(0, 359, 360//self.num_agents), dtype=torch.float)
+        )
+        return (torch.stack([-torch.cos(rads), torch.sin(rads)], dim=-1) * r), \
+            (torch.stack([torch.zeros(rads.shape[-1]), torch.zeros(rads.shape[-1]), torch.sin(-rads/2), torch.cos(-rads/2)], dim=-1))
+        
+
 
 
 #####################################################################

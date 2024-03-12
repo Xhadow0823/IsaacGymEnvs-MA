@@ -2,6 +2,28 @@ import torch
 from torch import Tensor
 
 
+r = 0.45
+def get_poses(r, rads):
+    return torch.stack([-torch.cos(rads), torch.sin(rads)], dim=-1) * r
+
+def get_rotates(rads):
+    return torch.stack([torch.zeros(rads.shape[-1]), torch.zeros(rads.shape[-1]), torch.sin(-rads/2), torch.cos(-rads/2)], dim=-1)
+
+n_agents = 4
+degs = torch.tensor(range(0, 359, 360//n_agents)).to(dtype=torch.float)
+print(degs)
+
+rads = torch.deg2rad(degs)
+print(rads)
+
+poses = get_poses(r, rads)
+print(poses)
+
+rotates = get_rotates(rads)
+print(rotates)
+
+exit()
+
 A = torch.arange(3*6*7).view(3, 6, 7)
 B = torch.arange(3*6*7).view(3, 6, 7) + (3*6*7)
 
