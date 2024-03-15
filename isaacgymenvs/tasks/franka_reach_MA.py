@@ -120,7 +120,12 @@ class FrankaReachMA(VecTask):
         (n_envs x n_rigid_body_per_env x 13) 13 is position[3], rotation[4], linear velocity and angular velocity
         '''
         self._contact_forces = None     # Contact forces in sim
-        '''碰撞的 force 資訊，目前沒有用到'''
+        '''碰撞的 force 資訊，維度是 (num_envs x num_rigids_per_env x 3)'''
+        self._hands_contact_forces = None
+        '''hand 這個 rigid body 的contact force, 維度是 (num_envs x num_agents x 3)'''
+        self._cube_contact_forces = None
+        '''cube 這個 rigid body 的 contact force, 維度是 (num_envs x 3)'''
+
         self._eef_state = None  # end effector state (at grasping point)
         ''' 是 _rigid_body_state 的 partial view,  panda_grip_site 這個 rigid body 的 state \ 
         (num_envs x num_agents x 13)
@@ -279,8 +284,8 @@ class FrankaReachMA(VecTask):
         self.num_franka_bodies = self.gym.get_asset_rigid_body_count(franka_asset)
         self.num_franka_dofs = self.gym.get_asset_dof_count(franka_asset)
 
-        print("num franka bodies: ", self.num_franka_bodies)
-        print("num franka dofs: ", self.num_franka_dofs)
+        # print("num franka bodies: ", self.num_franka_bodies)
+        # print("num franka dofs: ", self.num_franka_dofs)
 
         # set franka dof properties
         franka_dof_props = self.gym.get_asset_dof_properties(franka_asset)
@@ -336,8 +341,8 @@ class FrankaReachMA(VecTask):
         # compute aggregate size
         num_franka_bodies = self.gym.get_asset_rigid_body_count(franka_asset)
         num_franka_shapes = self.gym.get_asset_rigid_shape_count(franka_asset)
-        max_agg_bodies = num_franka_bodies + 4     # 1 for table, table stand, cubeA, cubeB
-        max_agg_shapes = num_franka_shapes + 4     # 1 for table, table stand, cubeA, cubeB
+        # max_agg_bodies = num_franka_bodies + 4     # 1 for table, table stand, cubeA, cubeB
+        # max_agg_shapes = num_franka_shapes + 4     # 1 for table, table stand, cubeA, cubeB
 
         self.envs = []
         self.frankas = []
@@ -398,7 +403,8 @@ class FrankaReachMA(VecTask):
             for franka_idx in range(1, self.num_agents+1):
                 franka_start_pose.p = gymapi.Vec3(*_p[franka_idx-1], franka_start_z)
                 franka_start_pose.r = gymapi.Quat(*_r[franka_idx-1])
-                franka_actor = self.gym.create_actor(env_ptr, franka_asset, franka_start_pose, f"franka{franka_idx}", i, 2, 0)
+                # franka_actor = self.gym.create_actor(env_ptr, franka_asset, franka_start_pose, f"franka{franka_idx}", i, 3, 0)
+                franka_actor = self.gym.create_actor(env_ptr, franka_asset, franka_start_pose, f"franka{franka_idx}", i, 2**(franka_idx+1), 0)
                 self.gym.set_actor_dof_properties(env_ptr, franka_actor, franka_dof_props)
                 self.frankas[i].append(franka_actor)
 
@@ -482,6 +488,13 @@ class FrankaReachMA(VecTask):
         # 選取8:8+2, 17:17+2 ... ，改成9個一排，選後2個。  維度變成 ((num_envs*num_agents) x 2)
         self._gripper_control = self._pos_control.view(-1, 9)[:, -2:]
         
+        self._contact_forces = gymtorch.wrap_tensor(self.gym.acquire_net_contact_force_tensor(self.sim)).view(*self._rigid_body_state.shape[:2], 3)
+        # 原本是 (所有rigid_body數量 x 3)，依據 _rigid_body_state 的維度去調整成 (num_envs x num_rigid_per_env x 3)
+        # 抓出手臂接觸力
+        self._hands_contact_forces = self._contact_forces[:, self.handles['hand'][0]::(self.handles['hand'][1] - self.handles['hand'][0]), :]
+        # 抓出目標接觸力
+        self._cube_contact_forces = self._contact_forces[:, self.handles['cubeA_body_handle'], :]
+
         # Initialize indices
         # TODO: 確保這個 global indice 維度與內容可以正確對應到所有 actors
         _num_actors = 3 + self.num_agents  # 一個 env 中有多少 actors
@@ -518,6 +531,7 @@ class FrankaReachMA(VecTask):
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
+        self.gym.refresh_net_contact_force_tensor(self.sim)
         self.gym.refresh_jacobian_tensors(self.sim)
         self.gym.refresh_mass_matrix_tensors(self.sim)
 
@@ -788,6 +802,15 @@ class FrankaReachMA(VecTask):
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], px[0], px[1], px[2]], [0.85, 0.1, 0.1])
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], py[0], py[1], py[2]], [0.1, 0.85, 0.1])
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0.1, 0.1, 0.85])
+        
+        # cf = torch.norm(self._cube_contact_forces[0])
+        # self.value_viz_rigid_body_color(self.envs[0], self._cubeA_id, 0, cf, (0., 1.))
+    # deprecated   this is not so useful
+    def value_viz_rigid_body_color(self, env, actor, rigid_idx, value=0., min_max=(0., 1.)):
+        r_value = (value-min_max[0]) / (min_max[1] - min_max[0]) + min_max[0]
+        r_value = 1.0 if r_value > 1.0 else r_value
+        color = gymapi.Vec3(0.3+r_value, 0.1, 0.1)
+        self.gym.set_rigid_body_color(env, actor, rigid_idx, gymapi.MESH_VISUAL, color)
 
     def _agent_ids_to_env_ids(self, agent_ids, use_AND_filter=True):
         '''輸入[0 1 2 3] 輸出 [0 1], 輸入 [0 3] 輸出 [], 當 num_agents=2, 且use_AND_filter=True ; \ 
