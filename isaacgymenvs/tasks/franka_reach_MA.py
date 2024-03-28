@@ -66,8 +66,17 @@ class FrankaReachMA(VecTask):
         assert self.control_type in {"osc", "joint_tor"},\
             "Invalid control type specified. Must be one of: {osc, joint_tor}"
 
+        self.num_targets = self.cfg["env"].get("numTargets", -1)
+        '''一個env中有多少個target(cube 數量)'''
+        if self.num_targets <= -1:
+            self.num_targets = self.cfg["env"].get("numAgents", -1)
+
         # dimensions
-        self.cfg["env"]["numObservations"] = 14+3    # 7 + 7 (pose of cube A and the eef pose) 3 (cubeA_eef_relative)
+        _all_target_state = self.num_targets * 3
+        _other_agent_state = self.cfg["env"].get("numAgents", 1)
+        _other_agent_state = (_other_agent_state - 1) * 3
+        _base_obs_state = 3 + 4 + 3  # 10 for eef_pos, eef_quat and relative_pos
+        self.cfg["env"]["numObservations"] = _base_obs_state + _all_target_state + _other_agent_state
         self.cfg["env"]["numActions"] = 6        # 6 dof (no gripper)
 
         # Values to be filled in at runtime
@@ -86,11 +95,6 @@ class FrankaReachMA(VecTask):
         '''int, 一個env有多少dof'''
         self.actions = None                     # Current actions to be deployed
         '''網路輸出的 actions ，這個tensor 會在 pre_physics_step 中被設定，並前處理完再套用到actor上'''
-        
-        self.num_targets = self.cfg["env"].get("numTargets", -1)
-        '''一個env中有多少個target(cube 數量)'''
-        if self.num_targets <= -1:
-            self.num_targets = self.cfg["env"].get("numAgents", -1)
 
         self._init_cubeA_state = None           # Initial state of cubeA for the current env
         ''' cubeA 的初始 actor state (姿態) \ 
@@ -132,6 +136,10 @@ class FrankaReachMA(VecTask):
         self._cubes_contact_forces = None
         '''cube 這個 rigid body 的 contact force, 維度是 (num_envs x num_targets x 3)'''
 
+        self._base_state = None
+        '''是_rigid_body_state 的 partial view, 手臂的 panda_link0 這個 rigid body 的 state(13) \ 
+        (num_envs x num_agents x 13)
+        '''
         self._eef_state = None  # end effector state (at grasping point)
         ''' 是 _rigid_body_state 的 partial view,  panda_grip_site 這個 rigid body 的 state \ 
         (num_envs x num_agents x 13)
@@ -169,10 +177,9 @@ class FrankaReachMA(VecTask):
         self._franka_effort_limits = None        # Actuator effort limits for franka
         self._global_indices = None         # Unique indices corresponding to all envs in flattened array
         '''所有的 env 的 所有 actor 的 indices，可以被用來作為 mask \ 
-        (num_envs x num_actors_per_env), \ 
+        維度是 (num_envs x num_actors_per_env), \ 
         ex: [[1 2 3][4 5 6]]
         ''' 
-        # TODO: 因為這個 uuid 規則改變了，所以有用到這個 array的 buffer 很可能是壞掉的，待確認
         
         self.debug_viz = self.cfg["env"]["enableDebugVis"]
 
@@ -429,12 +436,12 @@ class FrankaReachMA(VecTask):
 
         self.handles = {  # this is for RIGID BODY !!
             # Franka
-            "base":             [self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle_i, "panda_link0") for franka_handle_i in self.frankas[0]],
+            "base":              [self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle_i, "panda_link0") for franka_handle_i in self.frankas[0]],
             # TODO: 注意！！這邊的 handle 將不是用引用的，不能直接對應到原本值的變動！！！！ 待確認需求
-            "hand":             [self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle_i, "panda_hand") for franka_handle_i in self.frankas[0]],
-            "leftfinger_tip":   [self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle_i, "panda_leftfinger_tip") for franka_handle_i in self.frankas[0]],
-            "rightfinger_tip":  [self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle_i, "panda_rightfinger_tip") for franka_handle_i in self.frankas[0]],
-            "grip_site":        [self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle_i, "panda_grip_site") for franka_handle_i in self.frankas[0]],
+            "hand":              [self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle_i, "panda_hand") for franka_handle_i in self.frankas[0]],
+            "leftfinger_tip":    [self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle_i, "panda_leftfinger_tip") for franka_handle_i in self.frankas[0]],
+            "rightfinger_tip":   [self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle_i, "panda_rightfinger_tip") for franka_handle_i in self.frankas[0]],
+            "grip_site":         [self.gym.find_actor_rigid_body_handle(env_ptr, franka_handle_i, "panda_grip_site") for franka_handle_i in self.frankas[0]],
             # Cubes
             "cubeA_body_handle": [self.gym.find_actor_rigid_body_handle(env_ptr, cubeA_idx, "box") for cubeA_idx in self._cubeA_ids],
         }
@@ -511,26 +518,40 @@ class FrankaReachMA(VecTask):
     # TODO: 注意這邊有些維度是 ((num_envs*num_agents) x m); 有些是(num_envs x num_agents x m)，要確認是否需要在這邊統一或是自行使用 .view() 修改
     def _update_states(self):
         """update the self.state. Be called in ._refresh()"""
-        agent_ids = list(range(self.num_agents))  # TODO: 好像現在不需要這樣做誒，移除這個
+        def _get_min_relative_pos():
+            # self._cubeA_state[:, :, :3] - self._eef_state[:, :, :3]
+            c = self._cubeA_state[:, :, :3]
+            a = self._eef_state[:, :, :3]
+            relative_pos = (c.unsqueeze(1) - a.unsqueeze(2))  # [env, a, c, 3]
+            relative_norm = relative_pos.norm(dim=-1)  # [env, a, c]
+            min_distance_ids = torch.argmin(relative_norm, dim=-1)  # [env, a]
+            env_ids = torch.arange(min_distance_ids.shape[0]).unsqueeze(-1).expand(min_distance_ids.shape)
+            nc = c[env_ids, min_distance_ids]
+            return (nc - a), min_distance_ids  # 相對向量
+
+        cubeA_pos_min_relative, nearest_cubeA_ids = _get_min_relative_pos()
         self.states.update({
             # dof positions
-            "q": self._q[:, :],               # 所有關節位置(dof.pos)
-            "q_gripper": self._q[:, -2:],     # 夾爪關節位置(dof.pos)
+            "q":         self._q[:, :],    # 所有關節位置(dof.pos)
+            "q_gripper": self._q[:, -2:],  # 夾爪關節位置(dof.pos)
             # eef 姿態
-            "eef_pos": self._eef_state[:, :, :3],
-            "eef_quat": self._eef_state[:, :, 3:7],
-            "eef_vel": self._eef_state[:, :, 7:],  # NOTE: 這邊維度有變動，故 ocs 計算有用到要注意
-            "eef_lf_pos": self._eef_lf_state[:, :, :3],
-            "eef_rf_pos": self._eef_rf_state[:, :, :3],
+            "eef_pos":  self._eef_state[:, :, :3],   # 維度：(num_envs x num_agents x 3)
+            "eef_quat": self._eef_state[:, :, 3:7],  # 維度：(num_envs x num_agents x 4)
+            "eef_vel":  self._eef_state[:, :, 7:],   # 維度：(num_envs x num_agents x 6)
+            "eef_lf_pos": self._eef_lf_state[:, :, :3],  # NOT IMPLEMENT YET
+            "eef_rf_pos": self._eef_rf_state[:, :, :3],  # NOT IMPLEMENT YET
             # cube 姿態
-            "cubeA_quat": self._cubeA_state[:, :, 3:7],
-            "cubeA_pos":  self._cubeA_state[:, :, 0:3],
+            "cubeA_quat": self._cubeA_state[:, :, 3:7],  # 維度：(num_envs x num_targets x 4)
+            "cubeA_pos":  self._cubeA_state[:, :, 0:3],  # 維度：(num_envs x num_targets x 3)
             # cube 與 eef 相對位置
-            "cubeA_pos_relative": self._cubeA_state[:, 0, :3].unsqueeze(1).repeat_interleave(self.num_agents, dim=1) - self._eef_state[:, :, :3],  # TODO: THIS IS ONLY FOR TESTING
+            # "cubeA_pos_relative": self._cubeA_state[:, 0, :3].unsqueeze(1).repeat_interleave(self.num_agents, dim=1) - self._eef_state[:, :, :3], # target is only the first cube # TODO: THIS IS ONLY FOR TESTING
+            "cubeA_pos_relative": self._cubeA_state[:, :, :3] - self._eef_state[:, :, :3], # each one have one target
             #                              2 x (2 x 3)  -  2 x (2 x 3)
+            "cubeA_pos_min_relative": cubeA_pos_min_relative, # min dist of agent to random one target
+            "nearest_cubeA_ids": nearest_cubeA_ids, # min dist of agent to random one target
             # 新增一個基座姿態
-            "base_pos": self._base_state[:, :, :3],
-            "base_quat": self._base_state[:, :, 3:7]
+            "base_pos":  self._base_state[:, :, :3],  # 維度：(num_envs x num_agents x 3)
+            "base_quat": self._base_state[:, :, 3:7]  # 維度：(num_envs x num_agents x 3)
         })
 
     def _refresh(self):
@@ -549,8 +570,14 @@ class FrankaReachMA(VecTask):
     def compute_reward(self, actions):
         '''計算 reward 並儲存至 rew_buf 與 reset_buf '''
         self.rew_buf[:], self.reset_buf[:] = compute_franka_reward(
-            self.reset_buf, self.progress_buf, self.actions, self.states, self.reward_settings, self.max_episode_length
+            self.reset_buf, self.progress_buf, self.actions, self.states, self._hands_contact_forces, self.reward_settings, self.max_episode_length
         )
+
+        # nc = self.states["nearest_cubeA_ids"]
+        # env_ids = torch.arange(nc.shape[0]).unsqueeze(-1).expand(nc.shape)
+        # mask = torch.zeros_like(nc)
+        # mask[env_ids, nc] = 1
+        # is_all_target = mask.all(dim=-1)
 
     def compute_observations(self):
         '''整理出要交給 NN 進行推論的 obs_buf'''
@@ -565,13 +592,22 @@ class FrankaReachMA(VecTask):
         self._refresh()
         # obs = ["cubeA_quat", "cubeA_pos", "eef_quat", "eef_pos",   "base_pos", "base_quat", "cubeA_pos_relative"]  # 14+7+3
 
-        obs = ["cubeA_quat", "cubeA_pos"]
-        obs_target = torch.cat([self.states[ob][:, 0, :].contiguous().repeat_interleave(self.num_agents, dim=0) for ob in obs], dim=-1)  # TODO: ONLY FOR TESTING
+        # obs = ["cubeA_quat", "cubeA_pos"]
+        # # obs_target = torch.cat([self.states[ob][:, 0, :].contiguous().repeat_interleave(self.num_agents, dim=0) for ob in obs], dim=-1)  # share only one target # TODO: ONLY FOR TESTING
+        # obs_target = torch.cat([self.states[ob][:, :, :].contiguous().view(self.num_envs * self.num_targets, -1) for ob in obs], dim=-1)  # each agent to each target # TODO: ONLY FOR TESTING
+        obs_all_targets = self.states["cubeA_pos"].reshape(self.num_envs, -1).repeat_interleave(self.num_agents, dim=0)  # shape: ((self.num_envs*self.num_agents) x (self.num_targets*3))
         
-        obs = ["eef_quat", "eef_pos", "cubeA_pos_relative"]
+        obs = ["eef_quat", "eef_pos", "cubeA_pos_min_relative"]
         obs_self = torch.cat([self.states[ob].contiguous().view(self.num_envs * self.num_agents, -1) for ob in obs], dim=-1)
         
-        self.obs_buf = torch.cat([obs_target, obs_self], dim=-1)
+        # obs_others = None
+        _unshifted = self.states["eef_pos"].reshape(self.num_envs, -1)
+        shifted = []
+        for i in range(self.num_agents):
+            shifted.append( torch.cat((_unshifted[..., i*3:], _unshifted[..., :i*3]), dim=1) )
+        others_eef_pos = torch.stack(shifted, dim=1)[..., 3:].view(self.num_envs * self.num_agents, -1)
+
+        self.obs_buf = torch.cat([obs_all_targets, obs_self, others_eef_pos], dim=-1)
 
         return self.obs_buf
 
@@ -642,9 +678,7 @@ class FrankaReachMA(VecTask):
         self.progress_buf[new_agent_ids] = 0
         self.reset_buf[new_agent_ids] = 0
 
-    # 0123 modified  remove cubeB
-    # TODO: 這邊在改為multi-arm架構後，就一直沒有修改，待調整
-    def _reset_init_cube_state(self, cube, env_ids, check_valid=True):
+    def _reset_init_cube_state(self, cube=None, env_ids=None, check_valid=True):
         """注意：尚未檢查 target 是否重疊！！""" # TODO: implement the check_valid function!!
         if env_ids is None:
             env_ids = torch.arange(start=0, end=self.num_envs, device=self.device, dtype=torch.long)
@@ -652,11 +686,11 @@ class FrankaReachMA(VecTask):
 
         sampled_cube_state = torch.zeros(num_envs_to_reset, self.num_targets, 13, device=self.device)
         # self._init_cubeA_state
-        cube_heights = self.states["cubeA_size"] # TODO: 不一定需要這個參數做調整，待確認
+        cube_heights = self.states["cubeA_size"] # TODO: 不一定需要這個參數做調整，待確認需求
 
         rand_z_range = 0.5
         cube_rand_z = torch.rand(sampled_cube_state[:, :, 2].shape, device=self.device) * rand_z_range
-        sampled_cube_state[:, :, 2] = self._table_surface_pos[2] + cube_heights.squeeze(-1)[env_ids] / 2  + cube_rand_z
+        sampled_cube_state[:, :, 2] = self._table_surface_pos[2] + cube_heights[env_ids] / 2  + cube_rand_z
 
         centered_cube_xy_state = torch.tensor(self._table_surface_pos[:2], device=self.device, dtype=torch.float32)
         sampled_cube_state[:, :, 0:2] = centered_cube_xy_state.unsqueeze(0) + 2.0 * self.start_position_noise * (torch.rand(num_envs_to_reset, self.num_targets, 2, device=self.device) - 0.5)
@@ -806,6 +840,12 @@ class FrankaReachMA(VecTask):
             cubeA_rot = self.states["cubeA_quat"][:, 0, :]
             # cubeB_pos = self.states["cubeB_pos"]
             # cubeB_rot = self.states["cubeB_quat"]
+        
+            nc = self.states["nearest_cubeA_ids"]
+            env_ids = torch.arange(nc.shape[0]).unsqueeze(-1).expand(nc.shape)
+            mask = torch.zeros_like(nc)
+            mask[env_ids, nc] = 1
+            is_all_target = mask.sum(dim=-1) / self.num_agents
 
             # Plot visualizations
             for i in range(self.num_envs):
@@ -819,6 +859,11 @@ class FrankaReachMA(VecTask):
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], px[0], px[1], px[2]], [0.85, 0.1, 0.1])
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], py[0], py[1], py[2]], [0.1, 0.85, 0.1])
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0.1, 0.1, 0.85])
+                for agent_idx in range(self.num_agents):
+                    from_p = self.states["eef_pos"][i, agent_idx].cpu().numpy()
+                    to_p = from_p + self.states["cubeA_pos_min_relative"][i, agent_idx].cpu().numpy()
+                    # self.gym.add_lines(self.viewer, self.envs[i], 1, [*from_p, *to_p], [0.85, 0.1, 0.85])
+                    self.gym.add_lines(self.viewer, self.envs[i], 1, [*from_p, *to_p], [0.85, 0.1, 0.85])
         
     # deprecated   this is not so useful
     def value_viz_rigid_body_color(self, env, actor, rigid_idx, value=0., min_max=(0., 1.)):
@@ -882,18 +927,31 @@ class FrankaReachMA(VecTask):
 
 @torch.jit.script
 def compute_franka_reward(
-    reset_buf, progress_buf, actions, states, reward_settings, max_episode_length
+    reset_buf, progress_buf, actions, states, hands_contact_forces, reward_settings, max_episode_length
 ):
-    # type: (Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, float], float) -> Tuple[Tensor, Tensor]  # NOTE: this line is important for type checker
+    # type: (Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor, Dict[str, float], float) -> Tuple[Tensor, Tensor]  # NOTE: this line is important for type checker
 
     # distance from hand to the cubeA
-    d = torch.norm(states["cubeA_pos_relative"].view(-1, 3), dim=-1)
+    d = torch.norm(states["cubeA_pos_min_relative"].view(-1, 3), dim=-1)
 
-    # version 9
+    # dist reward and action cost
     a = 0.5  # 1 or 0.5 , 0.5 is better
     dist_reward = 1.0 / (a + d * d)
     actions_cost = torch.sum(actions ** 2, dim=-1) * 0.01
     rewards = dist_reward - actions_cost
+
+    # all touched reward and colliding punishment
+    num_agents = states["cubeA_pos_min_relative"].shape[1]
+    _nc = states["nearest_cubeA_ids"]
+    env_ids = torch.arange(_nc.shape[0]).unsqueeze(-1).expand(_nc.shape)
+    mask = torch.zeros_like(_nc)
+    mask[env_ids, _nc] = 1
+    all_touched_reward = (mask.sum(dim=-1)/num_agents).repeat_interleave(num_agents, dim=0) * 1.
+
+    _colliding_hands = (torch.norm(hands_contact_forces.reshape(-1, 3), dim=-1) >= 0.1)
+    colliding_punishment = _colliding_hands * -10.
+    rewards = rewards + (all_touched_reward + colliding_punishment)
+
     rewards = torch.clip(rewards, 0., None)
 
     # Compute resets

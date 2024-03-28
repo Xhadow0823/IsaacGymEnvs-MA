@@ -1,6 +1,126 @@
 import torch
 from torch import Tensor
 
+A = torch.tensor([[0, 1], [0, 0]])
+print(A)
+
+B = torch.unique(A, dim=-1, return_counts=True)
+print(B)
+
+
+env_ids = torch.arange(A.shape[0]).unsqueeze(-1).expand(A.shape)
+nc = torch.zeros(A.shape)
+nc[env_ids, A] = 1
+print(nc.all(dim=-1))
+
+exit()
+
+# GPT給的是錯的拉，氣死 :)
+A = torch.arange(2 * 2 * 3).view(2, 2, 3)
+print(A)
+
+ids = torch.tensor([[0, 1], [1, 1]], dtype=torch.long)
+print(ids)
+
+# ids_env = torch.tensor([[0, 0], [1, 1]], dtype=torch.long)
+ids_env = torch.arange(ids.shape[0]).unsqueeze(-1).expand(ids.shape)
+print(ids_env)
+
+B = A[ids_env, ids]
+print(B)
+
+
+exit()
+
+a = torch.arange(2* 3).view(2,  1, 3)
+b = torch.arange(2* 3).view(2,  3, 1) + 3
+print(a)
+print(b)
+c = a - b
+print(c)
+
+min_ids = torch.argmin(c, dim=-1)
+print(min_ids)
+print("=====")
+
+print(c.index_select())
+
+exit()
+
+
+# 建立示例張量 A 和 B
+A = torch.randn(2, 3, 3)
+B = torch.randn(2, 3, 3)
+
+# 計算 A 和 B 之間的距離矩陣
+# 可以使用 torch.norm 或 torch.dist 來計算距離
+# 這裡使用 torch.norm
+distances = torch.norm(A.unsqueeze(1) - B.unsqueeze(2), dim=-1)  # [batch, b, a]
+
+# 找到每個 B 中物體對應的最近的 A 中物體的索引
+nearest_indices = torch.argmin(distances, dim=2)
+
+# 根據找到的最近的 A 中物體的索引，從 A 中提取相應的位置資訊
+nearest_positions = torch.gather(A, 2, nearest_indices.unsqueeze(2).expand(-1, -1, A.size(2)))
+
+print(nearest_positions)
+exit()
+
+A = torch.arange(2 * 3 * 3).view(2, 3, 3)
+print(A)
+
+B = A * 2.0
+print(B)
+
+a = A.repeat_interleave(3, dim=0).view(2, -1, 3, 3)
+b = B.repeat_interleave(3, dim=1).view(a.shape)
+
+print("=====")
+
+r = a - b
+print(r.shape)
+
+print( r[0, 0, 1] )  # (env, b, a)
+
+print("=====")
+
+n = r.norm(dim=-1)
+print(n.shape)
+print(n)
+
+print("=====")
+
+m = n.argmin(dim=-1)  # 找出每個 b 對 每個 a 的最小距離, 以及 最小 a 的 idx
+print(m)
+
+min_r = r[:, 0, 0, :]
+print(min_r.shape)
+
+exit()
+
+num_envs = 2
+num_agents = 3
+
+uid = torch.arange(num_envs * num_agents * 3).view(num_envs, num_agents, -1)
+print(uid.shape)
+print(uid)
+
+shifted = []
+for i in range(uid.shape[1]):
+    shifted.append( torch.cat((uid[:, i:, :], uid[:, :i, :]), dim=1) )
+
+print(torch.cat(shifted, dim=-1))
+
+print("=====")
+
+unshifted = uid.view(2, -1)
+print(unshifted)
+shifted = []
+for i in range(uid.shape[1]):
+    shifted.append( torch.cat((unshifted[..., i*3:], unshifted[..., :(i)*3]), dim=1) )
+print(torch.stack(shifted, dim=1))
+
+exit()
 
 r = 0.45
 def get_poses(r, rads):
