@@ -80,11 +80,11 @@ class FrankaReach(VecTask):
         # dimensions
         # obs include: cubeA_pose (7) + cubeB_pos (3) + eef_pose (7) + q_gripper (2)
         # self.cfg["env"]["numObservations"] = 19 if self.control_type == "osc" else 26
-        self.cfg["env"]["numObservations"] = 14 if self.control_type == "osc" else 7  # 0123 modified  obs is 3+4(cubeA_pose) now
+        self.cfg["env"]["numObservations"] = 20 if self.control_type == "osc" else 7  # 0123 modified  obs is 3+4(cubeA_pose) now
         # self.cfg["env"]["numObservations"] = 7 if self.control_type == "osc" else 7  # 7 obs version, worse
         # actions include: delta EEF if OSC (6) or joint torques (7) + bool gripper (1)
         # self.cfg["env"]["numActions"] = 7 if self.control_type == "osc" else 8
-        self.cfg["env"]["numActions"] = 6 if self.control_type == "osc" else 7  # 0123 modified  remove actions of gripper(eef)
+        self.cfg["env"]["numActions"] = 7 if self.control_type == "osc" else 7  # 0123 modified  remove actions of gripper(eef)
 
         # Values to be filled in at runtime
         self.states = {}                        # will be dict filled with relevant states to use for reward calculation
@@ -97,6 +97,7 @@ class FrankaReach(VecTask):
         # self._cubeB_state = None                # Current state of cubeB for the current env
         self._cubeA_id = None                   # Actor ID corresponding to cubeA for a given env
         # self._cubeB_id = None                   # Actor ID corresponding to cubeB for a given env
+        self.extras = {}
 
         # Tensor placeholders
         self._root_state = None             # State of root body        (n_envs, 13)
@@ -211,7 +212,7 @@ class FrankaReach(VecTask):
 
         # Create cubeA asset
         cubeA_opts = gymapi.AssetOptions()
-        cubeA_opts.disable_gravity = True  # modified 0122  disable cube gravity
+        cubeA_opts.disable_gravity = False  # modified 0122  disable cube gravity
         cubeA_asset = self.gym.create_box(self.sim, *([self.cubeA_size] * 3), cubeA_opts)
         cubeA_color = gymapi.Vec3(0.6, 0.1, 0.0)
 
@@ -324,7 +325,7 @@ class FrankaReach(VecTask):
 
 
             # Create cubes
-            self._cubeA_id = self.gym.create_actor(env_ptr, cubeA_asset, cubeA_start_pose, "cubeA", i, 2, 0)  # modified 0122  change the franka's collision mask
+            self._cubeA_id = self.gym.create_actor(env_ptr, cubeA_asset, cubeA_start_pose, "cubeA", i, 4, 0)  # modified 0122  change the franka's collision mask
             # self._cubeB_id = self.gym.create_actor(env_ptr, cubeB_asset, cubeB_start_pose, "cubeB", i, 2, 0)
             # Set colors
             self.gym.set_rigid_body_color(env_ptr, self._cubeA_id, 0, gymapi.MESH_VISUAL, cubeA_color)
@@ -405,6 +406,20 @@ class FrankaReach(VecTask):
         self._global_indices = torch.arange(self.num_envs * 4, dtype=torch.int32,  # 0123 modified  remove cube so n_actors in a env is 4 now
                                            device=self.device).view(self.num_envs, -1)
 
+    def FSM(self):
+        d = torch.norm(self.states["cubeA_pos_relative"], dim=-1)
+        state_machine = torch.zeros_like(d, dtype=torch.long)
+
+        half_cubeA_size = self.states["cubeA_size"]/2
+        is_on_cubeA = d <= (half_cubeA_size*0.9)
+        state_machine = torch.where(is_on_cubeA, 1, state_machine)
+
+        is_gripper_closed = self.actions[:, -1] < 0 if self.actions is not None else torch.zeros_like(d, dtype=torch.bool)
+        state_machine = torch.where(is_on_cubeA & is_gripper_closed, 2, state_machine)
+
+        return state_machine
+
+        
     def _update_states(self):
         """update the self.state"""
         self.states.update({
@@ -423,6 +438,9 @@ class FrankaReach(VecTask):
             # "cubeB_quat": self._cubeB_state[:, 3:7],
             # "cubeB_pos": self._cubeB_state[:, :3],
             # "cubeA_to_cubeB_pos": self._cubeB_state[:, :3] - self._cubeA_state[:, :3],
+        })
+        self.states.update({
+            "FSM": self.FSM(),
         })
 
     def _refresh(self):
@@ -444,30 +462,12 @@ class FrankaReach(VecTask):
 # modified 01/23  remove the obs of eef(gripper) and the info about CubeB
 # modified 01/30  add eef_pos and eef_quat into obs space, and the result is very good!!
     def compute_observations(self):
-        # old obs spec:
-        #   cubeA_quat: 4
-        #   cubeA_pos: 3
-        #   cubeA_to_cubeB_pos: 3
-        #   eef_pos: 3
-        #   eef_quat: 4
-        #   q_gripper: 2
-        # total size: 19
-        
-        # -> new obs spec:
-        #   cubeA_quat: 4
-        #   cubeA_pos: 3
-        #   eef_quat: 4
-        #   eef_pos: 3
-        # total size: 14
-
         self._refresh()
-        # obs = ["cubeA_quat", "cubeA_pos", "cubeA_to_cubeB_pos", "eef_pos", "eef_quat"]  # original
-        obs = ["cubeA_quat", "cubeA_pos", "eef_quat", "eef_pos"]  # 14 obs version, better a lots
-        # obs = ["cubeA_quat", "cubeA_pos"] # 7 obs version
-        # obs += ["q_gripper"] if self.control_type == "osc" else ["q"]  # q_gripper is the last two element of the q
-        self.obs_buf = torch.cat([self.states[ob] for ob in obs], dim=-1)
 
-        maxs = {ob: torch.max(self.states[ob]).item() for ob in obs}
+        obs = ["cubeA_quat", "cubeA_pos", "eef_quat", "eef_pos", "cubeA_pos_relative"]
+        obs += ["q_gripper"]
+        obs += ["FSM"]
+        self.obs_buf = torch.cat([self.states[ob].view(self.num_envs, -1) for ob in obs], dim=-1)
 
         return self.obs_buf
 
@@ -653,14 +653,9 @@ class FrankaReach(VecTask):
     def pre_physics_step(self, actions):
         """do preprocess of the actions from actor and send them into the simulation """
         self.actions = actions.clone().to(self.device)
-        # print( self.actions.shape )
 
         # Split arm and gripper command
-        # u_arm, u_gripper = self.actions[:, :-1], self.actions[:, -1]
-        u_arm = self.actions[:, :6]  # shape: (n_envs, 6) u_arn size is the same
-
-        # print(u_arm, u_gripper)
-        # print(self.cmd_limit, self.action_scale)
+        u_arm, u_gripper = self.actions[:, :6], self.actions[:, 6]
 
         # Control arm (scale value first)
         u_arm = u_arm * self.cmd_limit / self.action_scale
@@ -671,18 +666,16 @@ class FrankaReach(VecTask):
         self._arm_control[:, :6] = u_arm[:, :6]
 
         # Control gripper
-        # u_fingers = torch.zeros_like(self._gripper_control)
-        # u_fingers[:, 0] = torch.where(u_gripper >= 0.0, self.franka_dof_upper_limits[-2].item(),
-        #                               self.franka_dof_lower_limits[-2].item())
-        # u_fingers[:, 1] = torch.where(u_gripper >= 0.0, self.franka_dof_upper_limits[-1].item(),
-        #                               self.franka_dof_lower_limits[-1].item())
+        u_fingers = torch.zeros_like(self._gripper_control)
+        u_fingers[:, 0] = torch.where(u_gripper >= 0.0, self.franka_dof_upper_limits[-2].item(),
+                                      self.franka_dof_lower_limits[-2].item())
+        u_fingers[:, 1] = torch.where(u_gripper >= 0.0, self.franka_dof_upper_limits[-1].item(),
+                                      self.franka_dof_lower_limits[-1].item())
         # # Write gripper command to appropriate tensor buffer
-        # self._gripper_control[:, :] = u_fingers
+        self._gripper_control[:, :] = u_fingers
 
         # Deploy actions
-        # self._gripper_control is partial view of self._pos_control
-        # self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self._pos_control))  # we dont need this control anymore
-        # self._arm_control is partial view of self._effort_control
+        self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self._pos_control))  # this is for gripper
         self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self._effort_control))
 
     def post_physics_step(self):
@@ -724,6 +717,18 @@ class FrankaReach(VecTask):
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], px[0], px[1], px[2]], [0.85, 0.1, 0.1])
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], py[0], py[1], py[2]], [0.1, 0.85, 0.1])
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0.1, 0.1, 0.85])
+        ############################# DEBUG ZONE #################################
+        cubeA_height = self.states["cubeA_pos"][:, 2] - self.reward_settings["table_height"]
+
+        height_reward = torch.tanh(5 * cubeA_height) * 10 + cubeA_height * 10
+        lift_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        lift_reward = torch.where(self.states["FSM"]>=1, height_reward, lift_reward)
+        
+        self.extras["cubeA_height"] = cubeA_height.mean()
+        self.extras["FSM"] = self.states["FSM"].to(dtype=torch.float).mean()
+        if self.viewer:
+            print(cubeA_height[0], lift_reward[0])
+        ############################# DEBUG ZONE #################################
 
 #####################################################################
 ###=========================jit functions=========================###
@@ -788,50 +793,58 @@ def compute_franka_reward(
     reset_buf, progress_buf, actions, states, reward_settings, max_episode_length
 ):
     # type: (Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, float], float) -> Tuple[Tensor, Tensor]  # NOTE: this line is important for type checker
-    
-    # distance from hand to the cubeA
-    d = torch.norm(states["cubeA_pos"] - states["eef_pos"], dim=-1)
-    # version 1
-    # dist_reward = 40 - d
-    # rewards = reward_settings["r_dist_scale"] * dist_reward
-    # version 2
-    # dist_reward = 1.5 - d
-    # rewards = dist_reward
-    # version 3
-    # dist_reward = -torch.log10(d + 0.1)
-    # rewards = dist_reward
-    # version 4
-    # dist_reward = torch.exp(-d)
-    # rewards = dist_reward
-    # version 4.5
-    # dist_reward = torch.exp(-d)
-    # touch_bonus = torch.where(d <= states["cubeA_size"]/2, 10, 0)
-    # rewards = dist_reward + touch_bonus
-    # version 5
-    # y=-\log\left(x\right)\cdot2+0.1
-    # dist_reward = -torch.log10(2 * d + 0.1)
-    # rewards = dist_reward
-    # version 6
-    # dist_punish = -d
-    # rewards += dist_punish
-    # version 7
-    # dist_reward = torch.exp(-d) * 10
-    # remain_bonus = (1 - progress_buf / max_episode_length) * 50
-    # touch_bonus = torch.where(d <= states["cubeA_size"]/2, remain_bonus, torch.zeros_like(remain_bonus))
-    # rewards = dist_reward + touch_bonus
-    # version 8
-    # dist_reward = 1.0 / (1.0 + d * d)
-    # rewards = dist_reward
+    cubeA_size = states["cubeA_size"]
+    half_cubeA_size = cubeA_size/2
 
-    # version 9
-    dist_reward = 1.0 / (1.0 + d * d)
-    actions_cost = torch.sum(actions ** 2, dim=-1) * 0.01
-    rewards = dist_reward - actions_cost
+    # distance from hand to the cubeA
+    # d = torch.norm(states["cubeA_pos"] - states["eef_pos"], dim=-1)
+    d = torch.norm(states["cubeA_pos_relative"], dim=-1)
+    rewards = torch.zeros_like(d)
+
+    # dist reward
+    a = 0.5
+    dist_reward = 1.0 / (a + d**2)
+    rewards += dist_reward
+    # action cost
+    actions_cost = -torch.sum(actions ** 2, dim=-1) * 0.00  ### NOTE THIS
+    rewards += actions_cost
+
+    # touched reward
+    is_close= d <= half_cubeA_size
+    touched_reward = torch.zeros_like(d)
+    touched_reward = torch.where(is_close, dist_reward, touched_reward)
+    rewards += touched_reward
+
+    # state reward
+    state_reward = states["FSM"].to(dtype=torch.float)
+    rewards += state_reward
+
+    # gripper reward
+    a_gripper = actions[:, -1]  # <=0 is close
+    gripper_reward = torch.zeros_like(a_gripper)
+    open_reward  = torch.tanh( a_gripper * 3.0)
+    close_reward = torch.tanh(-a_gripper * 3.0)  # best
+    gripper_reward = torch.where(states["FSM"] >= 1, close_reward, open_reward)
+    rewards += gripper_reward
+
+    # lift reward
+    cubeA_height = states["cubeA_pos"][:, 2] - reward_settings["table_height"]
+    # height_reward = (torch.exp(cubeA_height)) * 10
+    # height_reward = cubeA_height * 50
+    height_reward = torch.tanh(5 * cubeA_height) * 10 + 10 * cubeA_height
+    lift_reward = torch.zeros_like(d)
+    lift_reward = torch.where(states["FSM"]==2, height_reward, lift_reward)
+    rewards += lift_reward
+
+    # sparse height bonus
+    height_bonus = torch.zeros_like(d)
+    height_bonus = torch.where(states["FSM"]==2, torch.floor(cubeA_height * 15)*10, height_bonus)
+    rewards += height_bonus
+
     rewards = torch.clip(rewards, 0., None)
 
     # Compute resets
     reset_buf = torch.where(
-        # (progress_buf >= max_episode_length - 1) | (d <= states["cubeA_size"]/2), 
         (progress_buf >= max_episode_length - 1), 
         torch.ones_like(reset_buf), reset_buf)
 
