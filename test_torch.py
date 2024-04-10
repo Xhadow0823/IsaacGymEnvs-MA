@@ -1,6 +1,14 @@
 import torch
 from torch import Tensor
 
+A = torch.ones(4)
+print(A)
+
+B = A.mean()
+print(B)
+
+exit()
+
 A = torch.tensor([[0, 1], [0, 0]])
 print(A)
 

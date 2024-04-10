@@ -12,7 +12,7 @@ from isaacgymenvs.tasks.base.vec_task import VecTask
 
 # this block is for bypassing the type checking in reward function
 from torch import Tensor
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Any
 
 @torch.jit.script
 def axisangle2quat(vec, eps=1e-6):
@@ -79,11 +79,9 @@ class FrankaReach(VecTask):
 
         # dimensions
         # obs include: cubeA_pose (7) + cubeB_pos (3) + eef_pose (7) + q_gripper (2)
-        # self.cfg["env"]["numObservations"] = 19 if self.control_type == "osc" else 26
-        self.cfg["env"]["numObservations"] = 20 if self.control_type == "osc" else 7  # 0123 modified  obs is 3+4(cubeA_pose) now
-        # self.cfg["env"]["numObservations"] = 7 if self.control_type == "osc" else 7  # 7 obs version, worse
+        self.cfg["env"]["numObservations"] = 14 if self.control_type == "osc" else 7  # 0123 modified  obs is 3+4(cubeA_pose) now
+        
         # actions include: delta EEF if OSC (6) or joint torques (7) + bool gripper (1)
-        # self.cfg["env"]["numActions"] = 7 if self.control_type == "osc" else 8
         self.cfg["env"]["numActions"] = 7 if self.control_type == "osc" else 7  # 0123 modified  remove actions of gripper(eef)
 
         # Values to be filled in at runtime
@@ -213,6 +211,7 @@ class FrankaReach(VecTask):
         # Create cubeA asset
         cubeA_opts = gymapi.AssetOptions()
         cubeA_opts.disable_gravity = False  # modified 0122  disable cube gravity
+        # cubeA_opts.density = 500   # default is 1000
         cubeA_asset = self.gym.create_box(self.sim, *([self.cubeA_size] * 3), cubeA_opts)
         cubeA_color = gymapi.Vec3(0.6, 0.1, 0.0)
 
@@ -407,19 +406,22 @@ class FrankaReach(VecTask):
                                            device=self.device).view(self.num_envs, -1)
 
     def FSM(self):
+        # state 0
         d = torch.norm(self.states["cubeA_pos_relative"], dim=-1)
         state_machine = torch.zeros_like(d, dtype=torch.long)
 
+        # state 1
         half_cubeA_size = self.states["cubeA_size"]/2
         is_on_cubeA = d <= (half_cubeA_size*0.9)
         state_machine = torch.where(is_on_cubeA, 1, state_machine)
 
+        # state 2
         is_gripper_closed = self.actions[:, -1] < 0 if self.actions is not None else torch.zeros_like(d, dtype=torch.bool)
         state_machine = torch.where(is_on_cubeA & is_gripper_closed, 2, state_machine)
 
         return state_machine
 
-        
+
     def _update_states(self):
         """update the self.state"""
         self.states.update({
@@ -435,6 +437,7 @@ class FrankaReach(VecTask):
             "cubeA_quat": self._cubeA_state[:, 3:7],
             "cubeA_pos": self._cubeA_state[:, :3],
             "cubeA_pos_relative": self._cubeA_state[:, :3] - self._eef_state[:, :3],
+            "cubeA_height": self._cubeA_state[:, 2] - self.reward_settings["table_height"]
             # "cubeB_quat": self._cubeB_state[:, 3:7],
             # "cubeB_pos": self._cubeB_state[:, :3],
             # "cubeA_to_cubeB_pos": self._cubeB_state[:, :3] - self._cubeA_state[:, :3],
@@ -455,7 +458,7 @@ class FrankaReach(VecTask):
         self._update_states()
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.reset_buf[:] = compute_franka_reward(
+        self.rew_buf[:], self.reset_buf[:], self.reward_components = compute_franka_reward(
             self.reset_buf, self.progress_buf, self.actions, self.states, self.reward_settings, self.max_episode_length
         )
 
@@ -464,7 +467,8 @@ class FrankaReach(VecTask):
     def compute_observations(self):
         self._refresh()
 
-        obs = ["cubeA_quat", "cubeA_pos", "eef_quat", "eef_pos", "cubeA_pos_relative"]
+        # obs = ["cubeA_quat", "cubeA_pos", "eef_quat", "eef_pos", "cubeA_pos_relative"]
+        obs = ["eef_quat", "eef_pos", "cubeA_pos_relative", "cubeA_height"]
         obs += ["q_gripper"]
         obs += ["FSM"]
         self.obs_buf = torch.cat([self.states[ob].view(self.num_envs, -1) for ob in obs], dim=-1)
@@ -718,16 +722,14 @@ class FrankaReach(VecTask):
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], py[0], py[1], py[2]], [0.1, 0.85, 0.1])
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0.1, 0.1, 0.85])
         ############################# DEBUG ZONE #################################
-        cubeA_height = self.states["cubeA_pos"][:, 2] - self.reward_settings["table_height"]
-
-        height_reward = torch.tanh(5 * cubeA_height) * 10 + cubeA_height * 10
-        lift_reward = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
-        lift_reward = torch.where(self.states["FSM"]>=1, height_reward, lift_reward)
         
-        self.extras["cubeA_height"] = cubeA_height.mean()
-        self.extras["FSM"] = self.states["FSM"].to(dtype=torch.float).mean()
+        self.extras.update(self.reward_components)
+        # self.extras["cubeA_height"] = cubeA_height.mean()
+        pass
+    
         if self.viewer:
-            print(cubeA_height[0], lift_reward[0])
+            # print(cubeA_height[0], lift_reward[0]
+            pass
         ############################# DEBUG ZONE #################################
 
 #####################################################################
@@ -787,59 +789,122 @@ def old_compute_franka_reward(
 
     return rewards, reset_buf
 
-bonus_rate = None
+
+# @torch.jit.script
+# def compute_franka_reward(
+#     reset_buf, progress_buf, actions, states, reward_settings, max_episode_length
+# ):
+#     # type: (Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, float], float) -> Tuple[Tensor, Tensor, Dict[str, Tensor]]  # NOTE: this line is important for type checker
+#     reward_components = {}
+
+#     cubeA_size = states["cubeA_size"]
+#     half_cubeA_size = cubeA_size/2
+
+#     # distance from hand to the cubeA
+#     # d = torch.norm(states["cubeA_pos"] - states["eef_pos"], dim=-1)
+#     d = torch.norm(states["cubeA_pos_relative"], dim=-1)
+#     rewards = torch.zeros_like(d)
+
+#     # dist reward
+#     a = 0.5
+#     dist_reward = 1.0 / (a + d**2) * 0.5
+#     rewards += dist_reward
+#     reward_components["r/dist_reward"] = dist_reward.mean()
+#     # action cost
+#     actions_cost = -torch.sum(actions ** 2, dim=-1) * 0.01  ### NOTE THIS
+#     rewards += actions_cost
+#     reward_components["r/actions_cost"] = actions_cost.mean()
+
+#     # touched reward
+#     is_close= d <= half_cubeA_size
+#     touched_reward = torch.zeros_like(d)
+#     touched_reward = torch.where(is_close, dist_reward, touched_reward)
+#     rewards += touched_reward
+#     reward_components["r/touched_reward"] = touched_reward.mean()
+
+#     # state reward
+#     state_reward = states["FSM"].to(dtype=torch.float)
+#     rewards += state_reward
+#     reward_components["r/state_reward"] = state_reward.mean()
+
+#     # gripper reward
+#     a_gripper = actions[:, -1]  # <=0 is close
+#     gripper_reward = torch.zeros_like(a_gripper)
+#     open_reward  = torch.tanh( a_gripper * 3.0)
+#     close_reward = torch.tanh(-a_gripper * 3.0)  # best
+#     gripper_reward = torch.where(states["FSM"] >= 1, close_reward, open_reward)
+#     rewards += gripper_reward
+#     reward_components["r/gripper_reward"] = gripper_reward.mean()
+
+#     # flip reward
+#     flip_reward = torch.zeros_like(d)
+#     inverse = states["cubeA_quat"].clone()
+#     inverse[:, 1:] *= -1.
+#     n = torch.norm(inverse - states["cubeA_quat"], dim=-1)
+#     flip_reward = torch.where(states["FSM"] >= 1, (2-n) * 10, flip_reward)
+#     rewards += flip_reward
+#     reward_components["r/flip_reward"] = flip_reward.mean()
+
+#     rewards = torch.clip(rewards, 0., None)
+
+#     # Compute resets
+#     reset_buf = torch.where(
+#         (progress_buf >= max_episode_length - 1), 
+#         torch.ones_like(reset_buf), reset_buf)
+
+#     return rewards, reset_buf, reward_components
+
 @torch.jit.script
 def compute_franka_reward(
     reset_buf, progress_buf, actions, states, reward_settings, max_episode_length
 ):
-    # type: (Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, float], float) -> Tuple[Tensor, Tensor]  # NOTE: this line is important for type checker
+    # type: (Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, float], float) -> Tuple[Tensor, Tensor, Dict[str, Tensor]]  # NOTE: this line is important for type checker
+    reward_components = {}
+
     cubeA_size = states["cubeA_size"]
     half_cubeA_size = cubeA_size/2
 
     # distance from hand to the cubeA
-    # d = torch.norm(states["cubeA_pos"] - states["eef_pos"], dim=-1)
     d = torch.norm(states["cubeA_pos_relative"], dim=-1)
+    a_gripper = actions[:, -1]  # <=0 is close
     rewards = torch.zeros_like(d)
 
-    # dist reward
+    # state 0
+    dist_reward = torch.zeros_like(d)
     a = 0.5
-    dist_reward = 1.0 / (a + d**2)
-    rewards += dist_reward
-    # action cost
-    actions_cost = -torch.sum(actions ** 2, dim=-1) * 0.00  ### NOTE THIS
-    rewards += actions_cost
+    dist_reward = 1.0 / (a + d**2) * 0.5  # 0~1
+    open_reward  = torch.tanh( a_gripper * 3.0) # -1~1
+    state_reward = (dist_reward + open_reward)/2 # -1~2
+    rewards += torch.where(states["FSM"] == 0, state_reward, torch.zeros_like(d))
+    reward_components["r/state0"] = state_reward.mean()
 
-    # touched reward
-    is_close= d <= half_cubeA_size
-    touched_reward = torch.zeros_like(d)
-    touched_reward = torch.where(is_close, dist_reward, touched_reward)
-    rewards += touched_reward
+    # state 1
+    close_reward = torch.tanh(-a_gripper * 3.0) # -1~1
+    state_reward = (dist_reward + close_reward)/2 # -1~2
+    rewards += state_reward
+    rewards += torch.where(states["FSM"] == 1, state_reward, torch.zeros_like(d))
+    reward_components["r/state1"] = state_reward.mean()
+    
+    # state 2
+    close_reward = torch.tanh(-a_gripper * 3.0) # -1~1
+    dh = states["cubeA_height"]
+    # h_reward = (1.0 / (0.5 + dh**2)) -1  # -1~1
+    h_reward = torch.tanh(3*dh)  # -1~1
+    state_reward = (close_reward + h_reward)/2  # -1~1
+    rewards += torch.where(states["FSM"] == 2, state_reward, torch.zeros_like(d))
+    reward_components["r/state2"] = state_reward.mean()
 
-    # state reward
+    # # state final (test)
+    # is_final = torch.abs(dh) <= 0.25
+    # final_reward = torch.zeros_like(d)
+    # final_reward = torch.where(is_final, h_reward, final_reward)
+    # rewards += final_reward
+    # reward_components["r/final"] = final_reward.mean()
+
+    # state-up reward
     state_reward = states["FSM"].to(dtype=torch.float)
     rewards += state_reward
-
-    # gripper reward
-    a_gripper = actions[:, -1]  # <=0 is close
-    gripper_reward = torch.zeros_like(a_gripper)
-    open_reward  = torch.tanh( a_gripper * 3.0)
-    close_reward = torch.tanh(-a_gripper * 3.0)  # best
-    gripper_reward = torch.where(states["FSM"] >= 1, close_reward, open_reward)
-    rewards += gripper_reward
-
-    # lift reward
-    cubeA_height = states["cubeA_pos"][:, 2] - reward_settings["table_height"]
-    # height_reward = (torch.exp(cubeA_height)) * 10
-    # height_reward = cubeA_height * 50
-    height_reward = torch.tanh(5 * cubeA_height) * 10 + 10 * cubeA_height
-    lift_reward = torch.zeros_like(d)
-    lift_reward = torch.where(states["FSM"]==2, height_reward, lift_reward)
-    rewards += lift_reward
-
-    # sparse height bonus
-    height_bonus = torch.zeros_like(d)
-    height_bonus = torch.where(states["FSM"]==2, torch.floor(cubeA_height * 15)*10, height_bonus)
-    rewards += height_bonus
+    reward_components["r/state"] = state_reward.mean()
 
     rewards = torch.clip(rewards, 0., None)
 
@@ -848,4 +913,4 @@ def compute_franka_reward(
         (progress_buf >= max_episode_length - 1), 
         torch.ones_like(reset_buf), reset_buf)
 
-    return rewards, reset_buf
+    return rewards, reset_buf, reward_components
