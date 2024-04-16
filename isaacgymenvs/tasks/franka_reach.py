@@ -142,7 +142,9 @@ class FrankaReach(VecTask):
         #self.cmd_limit = None                   # filled in later
 
         # Set control limits
-        self.cmd_limit = to_torch([0.1, 0.1, 0.1, 0.5, 0.5, 0.5], device=self.device).unsqueeze(0) if \
+        # self.cmd_limit = to_torch([1., 1., 1., 1., 1., 1.], device=self.device).unsqueeze(0) if \
+        # self.cmd_limit = to_torch([0.1, 0.1, 0.1, 0.5, 0.5, 0.5], device=self.device).unsqueeze(0) if \  // this is default value
+        self.cmd_limit = to_torch([0.75, 0.75, 0.75, 0.75, 0.75, 0.75], device=self.device).unsqueeze(0) if \
         self.control_type == "osc" else self._franka_effort_limits[:7].unsqueeze(0)
 
         # Reset all environments
@@ -419,6 +421,11 @@ class FrankaReach(VecTask):
         is_gripper_closed = self.actions[:, -1] < 0 if self.actions is not None else torch.zeros_like(d, dtype=torch.bool)
         state_machine = torch.where(is_on_cubeA & is_gripper_closed, 2, state_machine)
 
+        # # state 3
+        # base_pos = torch.tensor([-0.45, 0, 1.125], device=self.device)
+        # dp = torch.norm(self.states["cubeA_pos"] - base_pos, dim=-1)
+        # state_machine = torch.where((dp >= 0.6) & is_on_cubeA & is_gripper_closed, 3, state_machine)
+
         return state_machine
 
 
@@ -437,13 +444,16 @@ class FrankaReach(VecTask):
             "cubeA_quat": self._cubeA_state[:, 3:7],
             "cubeA_pos": self._cubeA_state[:, :3],
             "cubeA_pos_relative": self._cubeA_state[:, :3] - self._eef_state[:, :3],
-            "cubeA_height": self._cubeA_state[:, 2] - self.reward_settings["table_height"]
+            "cubeA_height": self._cubeA_state[:, 2] - self.reward_settings["table_height"],
             # "cubeB_quat": self._cubeB_state[:, 3:7],
             # "cubeB_pos": self._cubeB_state[:, :3],
             # "cubeA_to_cubeB_pos": self._cubeB_state[:, :3] - self._cubeA_state[:, :3],
         })
+        FSM = self.FSM()
         self.states.update({
-            "FSM": self.FSM(),
+            "FSM": FSM,
+            "FSM_p": torch.pow(2.0, FSM),  # GOOD!!
+            # "FSM_p": FSM * 10.,  // not bad, but it is linear
         })
 
     def _refresh(self):
@@ -470,7 +480,7 @@ class FrankaReach(VecTask):
         # obs = ["cubeA_quat", "cubeA_pos", "eef_quat", "eef_pos", "cubeA_pos_relative"]
         obs = ["eef_quat", "eef_pos", "cubeA_pos_relative", "cubeA_height"]
         obs += ["q_gripper"]
-        obs += ["FSM"]
+        obs += ["FSM_p"]
         self.obs_buf = torch.cat([self.states[ob].view(self.num_envs, -1) for ob in obs], dim=-1)
 
         return self.obs_buf
@@ -725,9 +735,18 @@ class FrankaReach(VecTask):
         
         self.extras.update(self.reward_components)
         # self.extras["cubeA_height"] = cubeA_height.mean()
+        max_dh = self.states["cubeA_height"].mean()
+        self.extras["mean_cube_height"] = max_dh
+
+        # arm_base_pos = torch.tensor([-0.45, 0, 1.125], device=self.device)
+        # dp = torch.norm(self.states["cubeA_pos"] - arm_base_pos, dim=-1)
+        # self.extras["mean_cube_dist"] = (dp >= 0.8).to(torch.float).mean()
         pass
     
         if self.viewer:
+            # print(dp)
+            # print(dx)
+            # print(dh)
             # print(cubeA_height[0], lift_reward[0]
             pass
         ############################# DEBUG ZONE #################################
@@ -886,25 +905,19 @@ def compute_franka_reward(
     reward_components["r/state1"] = state_reward.mean()
     
     # state 2
-    close_reward = torch.tanh(-a_gripper * 3.0) # -1~1
     dh = states["cubeA_height"]
-    # h_reward = (1.0 / (0.5 + dh**2)) -1  # -1~1
-    h_reward = torch.tanh(3*dh)  # -1~1
-    state_reward = (close_reward + h_reward)/2  # -1~1
+    # h_reward = (10.) * dh  # 0~1  # testing
+    h_reward = torch.exp(2.5*dh)-1  # 0~inf  (good, max height 1.x)  # best one
+    state_reward = (h_reward)  # -1~1
     rewards += torch.where(states["FSM"] == 2, state_reward, torch.zeros_like(d))
     reward_components["r/state2"] = state_reward.mean()
 
-    # # state final (test)
-    # is_final = torch.abs(dh) <= 0.25
-    # final_reward = torch.zeros_like(d)
-    # final_reward = torch.where(is_final, h_reward, final_reward)
-    # rewards += final_reward
-    # reward_components["r/final"] = final_reward.mean()
-
     # state-up reward
+    # state_reward = torch.pow(2.0, states["FSM"].to(dtype=torch.float))-1
     state_reward = states["FSM"].to(dtype=torch.float)
     rewards += state_reward
     reward_components["r/state"] = state_reward.mean()
+
 
     rewards = torch.clip(rewards, 0., None)
 

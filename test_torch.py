@@ -1,11 +1,15 @@
 import torch
 from torch import Tensor
 
-A = torch.ones(4)
+A = torch.arange(3, dtype=torch.long)
+
+B1 = torch.tensor([0, 1, 3]).to(dtype=torch.float)
+
+B2 = torch.pow(2.0, A.to(dtype=torch.float))-1
 print(A)
 
-B = A.mean()
-print(B)
+dB = B1 - B2
+print(dB)
 
 exit()
 
