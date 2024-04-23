@@ -388,8 +388,8 @@ class FrankaCubeStack2(VecTask):
 
         # Initialize states
         self.states.update({
-            "cubeA_size": torch.ones_like(self._eef_state[:, 0]) * self.cubeA_size,
-            "cubeB_size": torch.ones_like(self._eef_state[:, 0]) * self.cubeB_size,
+            "cubeA_size": torch.ones_like(self._eef_state[:, 0]) * self.cubeA_size,  # default: 0.05
+            "cubeB_size": torch.ones_like(self._eef_state[:, 0]) * self.cubeB_size,  # default: 0.07
         })
 
         # Initialize actions
@@ -420,7 +420,7 @@ class FrankaCubeStack2(VecTask):
         state_machine = torch.where(is_on_cubeA & is_gripper_closed, 2, state_machine)
 
         # state 3
-        lifted = self.states["cubeA_height"] >= (self.states["cubeB_size"] + self.states["cubeA_size"]*0.6) # used to set as *0.8
+        lifted = self.states["cubeA_height"] >= (self.states["cubeB_size"] + self.states["cubeA_size"]*0.5) # 0.5 is the best
         state_machine = torch.where(is_on_cubeA & is_gripper_closed & lifted, 3, state_machine)
 
         # state 4
@@ -429,7 +429,6 @@ class FrankaCubeStack2(VecTask):
 
         # state 5
         is_gripper_opened = ~is_gripper_closed
-        # is_closer = (torch.norm(self.states["cubeA_to_cubeB_pos"], dim=-1) <= 0.002)
         state_machine = torch.where(aligned & is_gripper_opened, 5, state_machine)
 
         return state_machine
@@ -756,7 +755,7 @@ class FrankaCubeStack2(VecTask):
         if self.viewer:
             # print( torch.norm(self.states["cubeA_to_cubeB_pos"][:, :2], dim=-1) )
             # print( self.states["FSM"] )
-            print( self.actions[1, -1] )
+            # print( self.actions[1, -1] )
             # print( target_dist )
             # print(cubeA_height[0], lift_reward[0]
             pass
@@ -775,8 +774,6 @@ def compute_franka_reward(
 
     cubeA_size = states["cubeA_size"]
     cubeB_size = states["cubeB_size"]
-    
-    half_cubeA_size = cubeA_size/2
 
     # distance from hand to the cubeA
     d = torch.norm(states["cubeA_pos_relative"], dim=-1)
@@ -796,16 +793,13 @@ def compute_franka_reward(
     close_reward = torch.tanh(-a_gripper * 3.0) # -1~1
     close_reward = torch.clip(close_reward, 0., None)
     state_reward = (dist_reward + close_reward)/2 # -1~2 / 2
-    # rewards += state_reward  # NOOOOOOOOOOOOOOOOOOOOOOOO
     rewards += torch.where(states["FSM"] == 1, state_reward, torch.zeros_like(d))
     reward_components["r/state1"] = state_reward.mean()
     
     # state 2
     dh = states["cubeA_height"]
-    # h_reward = (10.) * dh  # 0~1  # testing
-    h_reward = torch.exp(2.5*dh)-1  # 0~inf  (good, max height 1.x)  # best one
+    h_reward = (dh / 0.095)  # 0~1 good ! 0-1
     h_reward = torch.clip(h_reward, None, 1.)  # NOTE THIS MAY BE TOO BIG
-    # state_reward = (h_reward)  # -1~1  # this is original
     state_reward = torch.where(states["FSM"] == 2, h_reward, torch.zeros_like(d))  # this is for the extras
     rewards += torch.where(states["FSM"] == 2, state_reward, torch.zeros_like(d))
     reward_components["r/state2"] = state_reward.mean()
@@ -814,22 +808,25 @@ def compute_franka_reward(
     target_pos_delta = states["cubeA_to_cubeB_pos"]
     target_pos_delta[:, 2] += (cubeA_size + cubeB_size)/2.
     target_dist = torch.norm(target_pos_delta, dim=-1)  # 0~
-    target_dist_reward = (torch.tanh(5. * -target_dist) + 1.) # 0~1  # <== 係數 放 5才能使初始x起作用，較能正常收斂，此係數不能太大。 (整體x2可以有稍微好一點的收斂速度)
-    state_reward = target_dist_reward
+    target_dist_reward = (torch.tanh(5. * -target_dist) + 1.) # 0~1  # <== 放5才能使初始x起作用，此係數不能太大
+    # target_dist_reward = -2*target_dist + 1 # 0~1  # rev.5  梯度太緩，效果不佳 # deprecated
+    # state_reward = target_dist_reward * 2.  # rev.6  前期過慢，後期不夠收斂，差評  # deprecated
+    state_reward = target_dist_reward  # best
     rewards += torch.where(states["FSM"] == 3, state_reward, torch.zeros_like(d))
     reward_components["r/stat3"] = state_reward.mean()
 
     # state 4
-    open_reward  = torch.tanh(a_gripper * 2.5) + 1 # 0~2  # <== make this bigger # a_gripper 有時很堅定在-1，所以這邊係數不要超過3，否則沒用
-    state_reward = open_reward * 2.
+    open_reward  = torch.tanh(a_gripper * 2.5) + 1 # 0~2  # <== a_gripper 有時很堅定在-1，所以這邊係數不要超過3 # 注意這邊值域到 2!!
+    # state_reward = open_reward * 2.  # original, bad # deprecated
+    state_reward = open_reward  # rev.7  效率非常好  # best
     rewards += torch.where(states["FSM"] == 4, state_reward, torch.zeros_like(d))
     reward_components["r/stat4"] = state_reward.mean()
 
     # state 5
-    closer_reward = (torch.tanh(13. * -target_dist) + 1) * 5  # 0~1
+    closer_reward = (torch.tanh(13. * -target_dist) + 1) * 5  # 0~1  # original
     state_reward = closer_reward
-    state_reward = torch.where(states["FSM"] == 5, closer_reward, torch.zeros_like(d))  # this is for the extras
-    rewards += torch.where(states["FSM"] == 5, state_reward+10., torch.zeros_like(d))
+    state_reward = torch.where(states["FSM"] == 5, state_reward, torch.zeros_like(d))  # this is for the extras
+    rewards += torch.where(states["FSM"] == 5, (state_reward+1) +9., torch.zeros_like(d))  # original
     reward_components["r/stat5"] = state_reward.mean()
 
     # state-up reward
