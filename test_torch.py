@@ -1,6 +1,17 @@
 import torch
 from torch import Tensor
 
+A = torch.arange(3*3, dtype=torch.float).view(3, 3)
+print(A)
+
+B1 = (A + 1) + 9.
+
+B2 = A + 10
+
+print(B1 == B2)
+
+exit()
+
 A = torch.arange(3, dtype=torch.long)
 
 B1 = torch.tensor([0, 1, 3]).to(dtype=torch.float)
