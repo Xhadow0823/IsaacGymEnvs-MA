@@ -59,6 +59,7 @@ from .industreal.industreal_task_pegs_insert import IndustRealTaskPegsInsert
 from .industreal.industreal_task_gears_insert import IndustRealTaskGearsInsert
 
 from .franka_reach_MA import FrankaReachMA
+from .franka_collect_MA import FrankaCollectMA
 
 
 def resolve_allegro_kuka(cfg, *args, **kwargs):
@@ -119,4 +120,5 @@ isaacgym_task_map = {
     "Trifinger": Trifinger,
 
     "FrankaReachMA": FrankaReachMA,
+    "FrankaCollectMA": FrankaCollectMA,
 }
