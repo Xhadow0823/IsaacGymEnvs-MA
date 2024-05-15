@@ -60,7 +60,7 @@ from .industreal.industreal_task_gears_insert import IndustRealTaskGearsInsert
 
 from .franka_reach_MA import FrankaReachMA
 from .franka_collect_MA import FrankaCollectMA
-
+from .franka_PPMA import FrankaPPMA
 
 def resolve_allegro_kuka(cfg, *args, **kwargs):
     subtask_name: str = cfg["env"]["subtask"]
@@ -121,4 +121,5 @@ isaacgym_task_map = {
 
     "FrankaReachMA": FrankaReachMA,
     "FrankaCollectMA": FrankaCollectMA,
+    "FrankaPPMA": FrankaPPMA,
 }
