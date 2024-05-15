@@ -9,7 +9,7 @@ env:
   numAgents: 2  # numArmsPerEnv, saved in VecTask  # NOTE: use "task.env.numAgents=3" to override this param
   numTargets: -1  # -1 for as same as the numAgents
   envSpacing: 1.5
-  episodeLength: 150  # default: 300
+  episodeLength: 300  # default: 300
   enableDebugVis: False
 
   clipObservations: 5.0
