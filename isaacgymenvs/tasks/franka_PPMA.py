@@ -404,7 +404,8 @@ class FrankaPPMA(VecTask):
             # Create cubes
             self._cubeA_ids = []
             for cubeA_idx in range(1, self.num_targets+1):
-                _cube_id = self.gym.create_actor(env_ptr, cubeA_asset, cubeA_start_pose, f"cubeA{cubeA_idx}", i, _cube_colid_mask, 0)  # modified 0122  change the franka's collision mask
+                # _cube_id = self.gym.create_actor(env_ptr, cubeA_asset, cubeA_start_pose, f"cubeA{cubeA_idx}", i, _cube_colid_mask, 0)  # modified 0122  change the franka's collision mask
+                _cube_id = self.gym.create_actor(env_ptr, cubeA_asset, cubeA_start_pose, f"cubeA{cubeA_idx}", i, 8 if cubeA_idx == 1 else 4, 0)  # for testing # rev.4
                 self._cubeA_ids.append(_cube_id)
                 # Set colors
                 self.gym.set_rigid_body_color(env_ptr, _cube_id, 0, gymapi.MESH_VISUAL, cubeA_color)
@@ -583,7 +584,8 @@ class FrankaPPMA(VecTask):
         state_machine = torch.where(is_align_dest, 4, state_machine)
 
         # state 5 - releasing
-        is_stack_able = torch.norm(self.states["dest_cubeA_relative"], dim=-1) <= (self.cubeA_size*0.7010 + self.dest_size/2.)  # only xy
+        # is_stack_able = torch.norm(self.states["dest_cubeA_relative"], dim=-1) <= (self.cubeA_size*0.7010 + self.dest_size/2.)  ＃ old
+        is_stack_able = torch.abs(self.states["dest_cubeA_relative"][..., 2]) <= (self.cubeA_size*0.7010 + self.dest_size/2.)  # only z
         state_machine = torch.where(is_align_dest & is_stack_able, 5, state_machine)
 
         # state 6 - GOAL
@@ -967,17 +969,9 @@ class FrankaPPMA(VecTask):
                     # self.gym.add_lines(self.viewer, self.envs[i], 1, [*from_p, *to_p], [0.85, 0.1, 0.85])
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [*from_p, *to_p], [0.85, 0.1, 0.85])
             
-            horizon_d = torch.norm(self.states["dest_cubeA_relative"][..., :2], dim=-1)
-            align_reward = torch.exp(-3. * (horizon_d)**2)
-
-            target_pos_offset = torch.tensor([0., 0., 0.05], device=self.device)
-            d_to_dest = torch.norm(self.states["dest_cubeA_relative"] + target_pos_offset, dim=-1)
-            desc_reward = (torch.exp(-5. * d_to_dest))
             if self.viewer: 
                 FSM = self.states["FSM"][1]  # only env1
                 print(FSM)
-                # print( dr )
-                print( desc_reward[1] )
 
         
     # deprecated   this is not so useful
@@ -1069,8 +1063,6 @@ def compute_franka_reward(
     state2_reward = torch.where(FSM == 2, lift_reward, torch.zeros_like(md))
 
     # state 3 - aligning
-    # horizon_d = torch.norm(states["dest_cubeA_relative"][..., :2], dim=-1)  # old
-    # align_reward = torch.exp(-3. * (horizon_d)**2).flatten()  # old, stuck on the top
     target_pos_offset = torch.tensor([0., 0., 0.05], device=md.device)
     d_to_target = torch.norm(states["dest_cubeA_relative"]+target_pos_offset, dim=-1)
     align_reward = torch.exp(-3. * d_to_target).flatten()
@@ -1079,7 +1071,7 @@ def compute_franka_reward(
     # state 4 - super-closing
     target_pos_offset = torch.tensor([0., 0., 0.05], device=md.device)
     d_to_dest = torch.norm(states["dest_cubeA_relative"] + target_pos_offset, dim=-1)
-    desc_reward = (torch.exp(-3. * d_to_dest)).flatten()
+    desc_reward = (torch.exp(-10. * d_to_dest)).flatten()  # rev4.2   # -10 is sensitive enough for learning super-close sub-policy
     state4_reward = torch.where(FSM == 4, desc_reward, torch.zeros_like(md))
 
     # state 5 - gripper opening
@@ -1088,7 +1080,7 @@ def compute_franka_reward(
 
     # state 6 - GOAL
     away_reward = torch.tanh(md)
-    state6_reward = torch.where(FSM == 6, away_reward + torch.ones_like(md)*10., torch.zeros_like(md))
+    state6_reward = torch.where(FSM == 6, away_reward, torch.zeros_like(md))  # rev 4.1
 
 
     # BSR
