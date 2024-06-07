@@ -39,6 +39,7 @@ from .factory.factory_task_nut_bolt_screw import FactoryTaskNutBoltScrew
 from .franka_cabinet import FrankaCabinet
 from .franka_cube_stack import FrankaCubeStack
 from .franka_cube_stack2 import FrankaCubeStack2
+from .franka_cube_stack_RRR import FrankaCubeStackRRR
 from .franka_reach import FrankaReach
 from .humanoid import Humanoid
 from .humanoid_amp import HumanoidAMP
@@ -124,4 +125,5 @@ isaacgym_task_map = {
     "FrankaCollectMA": FrankaCollectMA,
     "FrankaPPMA": FrankaPPMA,
     "FrankaCombineMA": FrankaCombineMA,
+    "FrankaCubeStackRRR": FrankaCubeStackRRR,
 }
