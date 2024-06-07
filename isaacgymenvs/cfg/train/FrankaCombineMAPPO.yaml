@@ -52,7 +52,7 @@ params:
     learning_rate: 3e-4   # default: 5e-4
     lr_schedule: adaptive
     schedule_type: standard
-    kl_threshold: 0.014  # 0.002 is too small
+    kl_threshold: 0.008  # 0.002 is too small
     # change this
     score_to_win: 10000
     # max epochs 1500  

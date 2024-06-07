@@ -78,7 +78,8 @@ class FrankaCombineMA(VecTask):
         _self_base_state = 3 + 3 + 7  #  relative_pos(3)x2 + base pose(7)
         _all_FSM_state = 2 * 1
         _self_gFSM = 1
-        self.cfg["env"]["numObservations"] = _all_target_state + _stack_base_state + _all_agent_state + _self_base_state + _all_FSM_state + _self_gFSM
+        _self_agent_idx = 1
+        self.cfg["env"]["numObservations"] = _all_target_state + _stack_base_state + _all_agent_state + _self_base_state + _all_FSM_state + _self_gFSM + _self_agent_idx
         self.cfg["env"]["numActions"] = 7        # 7 dof
         # assert self.cfg["env"]["numObservations"]==(_self_base_state+(2*7)+(2*3)+(1*3)+_FSM_obs) # deprecated
         # assert self.cfg["env"]["numActions"] == 7  # deprecated
@@ -190,6 +191,9 @@ class FrankaCombineMA(VecTask):
         ex: [[1 2 3][4 5 6]]
         ''' 
         
+        self.agent_idx = None
+        ' agent idx in each env, shape: [num_envs*num_agents x 1], set in init_data() '
+
         self.debug_viz = self.cfg["env"]["enableDebugVis"]
 
         self.up_axis = "z"
@@ -519,12 +523,16 @@ class FrankaCombineMA(VecTask):
         
         self._stack_base_state = self._root_state[:, self._stack_base_id, :]
 
+        self.agent_idx = torch.zeros(self.num_envs * self.num_agents, 1, dtype=torch.long, device=self.device)  # shape: [num_envs*num_agents x 1]
+        self.agent_idx[self.num_agents-1::self.num_agents, :] = 1
+
         # TODO: fix the size of cube A size!!
         # Initialize states
         self.states.update({
             # "cubeA_size": torch.ones_like(self._eef_state[:, 0]) * self.cubeA_size,  # the author use ones_like is for the device
             "cubeA_size": torch.ones(self.num_envs, 1, device=self.device) * self.cubeA_size,              # 2 x 1 
             # "cubeB_size": torch.ones_like(self._eef_state[:, 0]) * self.cubeB_size,
+            "agent_idx": self.agent_idx  # shape: [num_envs * num_agnets, 1]
         })
 
         # Initialize actions
@@ -556,37 +564,49 @@ class FrankaCombineMA(VecTask):
 
     def compute_FSM(self):
         md = torch.norm(self.states["cubeA_pos_relative"], dim=-1)  # shape: [num_envs x num_agents]
+        agent_idx = self.agent_idx.view(self.num_envs, self.num_agents)  # -> shape:[num_envs x num_agents]
+        is_agent_0 = agent_idx==0
+        is_agent_1 = ~is_agent_0
         cubeA_size = self.cubeA_size  # this is not tensor, good
         table_height = self.reward_settings["table_height"],  # 1.025
         
         # state 0 - approching
         state_machine = torch.zeros_like(md, dtype=torch.long)
 
+        # === FSM for agent 0 ===
         # # state 1 - holding
-        # is_gripper_on_cube = md <= (cubeA_size * 0.5 * 0.9)
-        # state_machine = torch.where(is_gripper_on_cube, 1, state_machine)
+        is_gripper_on_cube = md <= (cubeA_size * 0.5 * 0.9)
+        state_machine = torch.where(is_agent_0 & is_gripper_on_cube, 1, state_machine)
 
-        # # state 2 - lifting
-        # is_gripper_closed = self.actions[..., -1].view(self.num_envs, -1) < 0. if self.actions is not None else torch.zeros_like(md, dtype=torch.bool)
-        # state_machine = torch.where(is_gripper_on_cube & is_gripper_closed, 2, state_machine)
+        # state 2 - lifting
+        is_gripper_closed = self.actions[..., -1].view(self.num_envs, -1) < 0. if self.actions is not None else torch.zeros_like(md, dtype=torch.bool)
+        state_machine = torch.where(is_agent_0 & is_gripper_on_cube & is_gripper_closed, 2, state_machine)
 
         # # state 3 - aligning
         # # is_lifted = (self.states["cubeA_pos"][..., 2] - self.cubeA_size/2.) >= (self.states["dest_pos"][..., 2] + self.dest_size/2.)
-        # is_lifted = abs(self.states["dest_cubeA_relative"][..., 2]) >= (self.dest_size + self.cubeA_size)/2.
+        # is_lifted = abs(self.states["stack_base_cubeA_relative"][..., 2]) >= (self.dest_size + self.cubeA_size)/2.
         # state_machine = torch.where(is_gripper_on_cube & is_lifted, 3, state_machine)
 
         # # state 4 - super-closing
-        # is_align_dest = torch.norm(self.states["dest_cubeA_relative"][..., :2], dim=-1) < ((0.05)*0.5)  # only xy
+        # is_align_dest = torch.norm(self.states["stack_base_cubeA_relative"][..., :2], dim=-1) < ((0.05)*0.5)  # only xy
         # state_machine = torch.where(is_align_dest, 4, state_machine)
 
         # # state 5 - releasing
-        # # is_stack_able = torch.norm(self.states["dest_cubeA_relative"], dim=-1) <= (self.cubeA_size*0.7010 + self.dest_size/2.)  ＃ old
-        # is_stack_able = torch.abs(self.states["dest_cubeA_relative"][..., 2]) <= (self.cubeA_size*0.8660 + self.dest_size/2.)  # only z  # 0.7010 -> 0.8660
+        # # is_stack_able = torch.norm(self.states["stack_base_cubeA_relative"], dim=-1) <= (self.cubeA_size*0.7010 + self.dest_size/2.)  ＃ old
+        # is_stack_able = torch.abs(self.states["stack_base_cubeA_relative"][..., 2]) <= (self.cubeA_size*0.8660 + self.dest_size/2.)  # only z  # 0.7010 -> 0.8660
         # state_machine = torch.where(is_align_dest & is_stack_able, 5, state_machine)
 
         # # state 6 - GOAL
         # is_gripper_opened = ~is_gripper_closed
         # state_machine = torch.where(is_align_dest & is_stack_able & is_gripper_opened, 6, state_machine)
+        
+        # === FSM for agent 1 ===
+        # # state 1 - holding
+        is_gripper_on_cube = md <= (cubeA_size * 0.5 * 0.9)
+        state_machine = torch.where(is_agent_1 & is_gripper_on_cube, 1, state_machine)
+        # state 2 - lifting
+        is_gripper_closed = self.actions[..., -1].view(self.num_envs, -1) < 0. if self.actions is not None else torch.zeros_like(md, dtype=torch.bool)
+        state_machine = torch.where(is_agent_1 & is_gripper_on_cube & is_gripper_closed, 2, state_machine)
 
         return state_machine  # shape: [num_envs x num_agents]
     
@@ -671,7 +691,7 @@ class FrankaCombineMA(VecTask):
             "stack_base_quat": self._stack_base_state[..., 3:7],  # 維度：(num_envs x num_targets x 4)
             "stack_base_pos":  self._stack_base_state[..., 0:3],  # 維度：(num_envs x num_targets x 3)
             # cube 與 stack_base 相對位置
-            "stack_base_cubeA_relative": self._stack_base_state[..., :3] - self._cubeA_state[:, :, :3],  # each one have one target and one stack base  # TODO check this
+            "stack_base_cubeA_relative": self._stack_base_state[..., :3].unsqueeze(1).repeat_interleave(self.num_agents, dim=1) - self._cubeA_state[:, :, :3],  # each one have one target and one stack base  # TODO check this # NOTE this not used now
         })
         FSM = self.compute_FSM()
         self.states.update({
@@ -740,7 +760,7 @@ class FrankaCombineMA(VecTask):
             _shifted.append( torch.cat((_unshifted[..., i*4:], _unshifted[..., :i*4]), dim=1) )
         obs_all_other_eef_quat = torch.stack(_shifted, dim=1).view(self.num_envs * self.num_agents, -1)  # [num_envs x num_agents*4] -stack-> [num_envs x num_agents x num_agents*4] -> ...
 
-        # === prepareobs of FSM ===
+        # === prepare obs of FSM ===
         _unshifted = self.states["FSM_p"]  # shape: [num_envs x num_agents]
         _shifted = []
         for i in range(self.num_agents):
@@ -752,13 +772,17 @@ class FrankaCombineMA(VecTask):
             self.states["gFSM_p"].view(self.num_envs * self.num_agents, -1)
         ], dim=-1)
 
+        # === prepare agent_idx ===
+        # self.agent_idx  # shape: [num_envs * num_agents x 1]
+
         self.obs_buf = torch.cat([obs_all_target_quat,     # 8
                                   obs_all_target_pos,      # 6
                                   stack_base_pos,          # 3
                                   obs_self,                # 13
                                   obs_all_other_eef_pos,   # 6
                                   obs_all_other_eef_quat,  # 8
-                                  obs_FSM                  # 3
+                                  obs_FSM,                 # 3
+                                  self.agent_idx           # 1
                                   ], dim=-1)
 
         return self.obs_buf
@@ -1062,20 +1086,21 @@ def compute_franka_reward(
     md = torch.norm(states["cubeA_pos_relative"].view(-1, 3), dim=-1)
     FSM = states["FSM"].flatten()  # shape: [envs x agents] -> [envs*agents]
     gFSM = states["gFSM"]
+    agent_idx = states["agent_idx"].view(FSM.shape)
     rewards = torch.zeros_like(md)
 
-    # # state 0 - approaching
-    # approaching_reward = torch.exp(-5. * (md**2))
-    # state0_reward = torch.where(FSM == 0, approaching_reward, torch.zeros_like(md))
+    # state 0 - approaching
+    approaching_reward = torch.exp(-5. * (md**2))
+    state0_reward = torch.where(FSM == 0, approaching_reward, torch.zeros_like(md))
 
-    # # state 1 - gripper closing
-    # gripper_closing_reward = torch.exp(-1. * actions[:, -1])  # go to state 2 when a_gripper<0
-    # state1_reward = torch.where(FSM == 1, gripper_closing_reward, torch.zeros_like(md))
+    # state 1 - gripper closing
+    gripper_closing_reward = torch.exp(-1. * actions[:, -1])  # go to state 2 when a_gripper<0
+    state1_reward = torch.where(FSM == 1, gripper_closing_reward, torch.zeros_like(md))
 
-    # # state 2 - lifting
-    # diff_of_target_z = abs(states["dest_cubeA_relative"][..., 2])
-    # lift_reward = torch.clip((diff_of_target_z / ((0.05+0.05) * 0.5)), 0., 1.).flatten()
-    # state2_reward = torch.where(FSM == 2, lift_reward, torch.zeros_like(md))
+    # state 2 - lifting
+    diff_of_target_z = abs(states["stack_base_cubeA_relative"][..., 2])
+    lift_reward = torch.clip((diff_of_target_z / ((0.05+0.05) * 0.5)), 0., 1.).flatten()
+    state2_reward = torch.where(FSM == 2, lift_reward, torch.zeros_like(md))
 
     # # state 3 - aligning
     # target_pos_offset = torch.tensor([0., 0., 0.05], device=md.device)
@@ -1099,7 +1124,7 @@ def compute_franka_reward(
 
 
     # # BSR
-    # BSR = FSM.to(torch.float)
+    BSR = FSM.to(torch.float)
     # gBSR = gFSM.to(torch.float) * 0.5
     # # gBSR = torch.zeros_like(BSR)
     
@@ -1117,20 +1142,20 @@ def compute_franka_reward(
     # side_rule_reward = torch.zeros_like(md)
 
     # # sum up 
-    # # rewards = state0_reward + state1_reward + state2_reward + state3_reward + state4_reward + state5_reward + state6_reward +   BSR + gBSR + side_rule_reward
+    rewards = state0_reward + state1_reward + BSR
     # rewards = state0_reward + state1_reward + state2_reward + state3_reward + state4_reward + state5_reward + state6_reward +  BSR + gBSR + side_rule_reward
 
-    # rewards = torch.clip(rewards, 0., None)
+    rewards = torch.clip(rewards, 0., None)
 
-    # # for log
-    # reward_components["r/state0"] = state0_reward.mean()
-    # reward_components["r/state1"] = state1_reward.mean()
-    # reward_components["r/state2"] = state2_reward.mean()
+    # for log
+    reward_components["r/state0"] = state0_reward.mean()
+    reward_components["r/state1"] = state1_reward.mean()
+    reward_components["r/state2"] = state2_reward.mean()
     # reward_components["r/state3"] = state3_reward.mean()
     # reward_components["r/state4"] = state4_reward.mean()
     # reward_components["r/state5"] = state5_reward.mean()
     # reward_components["r/state6"] = state6_reward.mean()
-    # reward_components["r/BSR"] = BSR.mean()
+    reward_components["r/BSR"] = BSR.mean()
     # reward_components["r/gBSR"] = gBSR.mean()
     # reward_components["r/side_rule"] = side_rule_reward.mean()
 
