@@ -33,9 +33,11 @@ import torch
 from isaacgym import gymtorch
 from isaacgym import gymapi
 
-from isaacgymenvs.utils.torch_jit_utils import quat_mul, to_torch, tensor_clamp  
+from isaacgymenvs.utils.torch_jit_utils import quat_mul, to_torch, tensor_clamp, quat_apply
 from isaacgymenvs.tasks.base.vec_task import VecTask
 
+from torch import Tensor
+from typing import Dict, Tuple, Any
 
 @torch.jit.script
 def axisangle2quat(vec, eps=1e-6):
@@ -143,6 +145,12 @@ class FrankaCubeStack(VecTask):
         self.up_axis_idx = 2
 
         super().__init__(config=self.cfg, rl_device=rl_device, sim_device=sim_device, graphics_device_id=graphics_device_id, headless=headless, virtual_screen_capture=virtual_screen_capture, force_render=force_render)
+
+        # modified,  add camera look at
+        if self.viewer != None:
+            cam_pos    = gymapi.Vec3(6.0, 6.0, 3.4)
+            cam_target = gymapi.Vec3(0.0, 0.0, 1.0)
+            self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
 
         # Franka defaults
         self.franka_default_dof_pos = to_torch(
@@ -742,6 +750,7 @@ def compute_franka_reward(
     )
 
     # Compute resets
-    reset_buf = torch.where((progress_buf >= max_episode_length - 1) | (stack_reward > 0), torch.ones_like(reset_buf), reset_buf)
+    reset_buf = torch.where((progress_buf >= max_episode_length - 1) | (stack_reward > 0), torch.ones_like(reset_buf), reset_buf) # ORIGINAL, good
+    # reset_buf = torch.where((progress_buf >= max_episode_length - 1), torch.ones_like(reset_buf), reset_buf)  # not good, dont know why
 
     return rewards, reset_buf
