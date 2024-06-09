@@ -78,7 +78,7 @@ class FrankaCubeStackRRR(VecTask):
 
         # dimensions
         # obs include: cubeA_pose (7) + cubeB_pos (3) + eef_pose (7) + q_gripper (2)
-        self.cfg["env"]["numObservations"] = 19 if self.control_type == "osc" else 26
+        self.cfg["env"]["numObservations"] = 19 + 1 if self.control_type == "osc" else 26  # EXP: FCS-RRR-7S-1
         # actions include: delta EEF if OSC (6) or joint torques (7) + bool gripper (1)
         self.cfg["env"]["numActions"] = 7 if self.control_type == "osc" else 8
 
@@ -478,6 +478,7 @@ class FrankaCubeStackRRR(VecTask):
         self._refresh()
         obs = ["cubeA_quat", "cubeA_pos", "cubeA_to_cubeB_pos", "eef_pos", "eef_quat"]
         obs += ["q_gripper"]
+        obs += ["FSM_p"]  # EXP: FCS-RRR-7S-1
         self.obs_buf = torch.cat([self.states[ob].view(self.num_envs, -1) for ob in obs], dim=-1)
 
         return self.obs_buf
@@ -733,6 +734,7 @@ def compute_franka_reward(
 
     cubeA_size = states["cubeA_size"]
     cubeB_size = states["cubeB_size"]
+    FSM = states["FSM"]
 
     # distance from hand to the cubeA
     d = torch.norm(states["cubeA_pos_relative"], dim=-1)
@@ -743,59 +745,55 @@ def compute_franka_reward(
     dist_reward = torch.zeros_like(d)
     a = 0.5
     dist_reward = 1.0 / (a + d**2) * 0.5  # 0~1
-    # open_reward  = torch.tanh( a_gripper * 3.0) # -1~1
-    state_reward = (dist_reward) # -1~2
-    rewards += torch.where(states["FSM"] == 0, state_reward, torch.zeros_like(d))
-    reward_components["r/state0"] = state_reward.mean()
+    state0_reward = torch.where(FSM == 0, dist_reward, torch.zeros_like(d))
 
     # state 1
     close_reward = torch.tanh(-a_gripper * 3.0) # -1~1
     close_reward = torch.clip(close_reward, 0., None)
     state_reward = (dist_reward + close_reward)/2 # -1~2 / 2
-    rewards += torch.where(states["FSM"] == 1, state_reward, torch.zeros_like(d))
-    reward_components["r/state1"] = state_reward.mean()
-    
+    state1_reward = torch.where(FSM == 1, state_reward, torch.zeros_like(d))
+
     # state 2
     dh = states["cubeA_height"]
     h_reward = (dh / 0.095)  # 0~1 good ! 0-1
     h_reward = torch.clip(h_reward, None, 1.)  # NOTE THIS MAY BE TOO BIG
-    state_reward = torch.where(states["FSM"] == 2, h_reward, torch.zeros_like(d))  # this is for the extras
-    rewards += torch.where(states["FSM"] == 2, state_reward, torch.zeros_like(d))
-    reward_components["r/state2"] = state_reward.mean()
+    state2_reward = torch.where(FSM == 2, h_reward, torch.zeros_like(d))
 
     # state 3
     target_pos_delta = states["cubeA_to_cubeB_pos"]
     target_pos_delta[:, 2] += (cubeA_size + cubeB_size)/2.
     target_dist = torch.norm(target_pos_delta, dim=-1)  # 0~
     target_dist_reward = (torch.tanh(5. * -target_dist) + 1.) # 0~1  # <== 放5才能使初始x起作用，此係數不能太大
-    state_reward = target_dist_reward  # best
-    rewards += torch.where(states["FSM"] == 3, state_reward, torch.zeros_like(d))
-    reward_components["r/stat3"] = state_reward.mean()
+    state3_reward = torch.where(FSM == 3, target_dist_reward, torch.zeros_like(d))
 
-    # === THE NEW 7 ===
     # state 4 - closer
     closer_reward = (torch.tanh(6. * -target_dist) + 1) # 0~1
-    state_reward = closer_reward
-    rewards += torch.where(states["FSM"] == 4, state_reward, torch.zeros_like(d))
-    reward_components["r/stat4"] = state_reward.mean()
+    state4_reward = torch.where(FSM == 4, closer_reward, torch.zeros_like(d))
 
     # state 5 - open
-    open_reward  = torch.tanh(a_gripper * 7) + 1 # good, faster
-    state_reward = open_reward
-    rewards += torch.where(states["FSM"] == 5, state_reward, torch.zeros_like(d))
-    reward_components["r/stat5"] = state_reward.mean()
+    # open_reward  = torch.tanh(a_gripper * 7) + 1 # exp-2
+    open_reward  = torch.tanh(a_gripper * 2) + 1 # exp-3
+    state5_reward = torch.where(FSM == 5, open_reward, torch.zeros_like(d))
 
     # state 6 - stack and away
     state_reward = torch.tanh(7. * d)  # faster, but may slower for less collision?!
-    rewards += torch.where(states["FSM"] == 6, (state_reward+10), torch.zeros_like(d))
-    reward_components["r/state6"] = state_reward.mean()
+    state6_reward = torch.where(FSM == 6, state_reward + 5, torch.zeros_like(d))
 
-    # state-up reward
-    state_reward = states["FSM"].to(dtype=torch.float)  # * 1.
-    rewards += state_reward
-    reward_components["r/state"] = state_reward.mean()
+    # state-up reward (BSR)
+    BSR = states["FSM"].to(torch.float)
+
+    rewards = state0_reward + state1_reward + state2_reward + state3_reward + state4_reward + state5_reward + state6_reward +  BSR
 
     rewards = torch.clip(rewards, 0., None)
+
+    reward_components["r/state0"] = state0_reward.mean()
+    reward_components["r/state1"] = state1_reward.mean()
+    reward_components["r/state2"] = state2_reward.mean()
+    reward_components["r/state3"] = state3_reward.mean()
+    reward_components["r/state4"] = state4_reward.mean()
+    reward_components["r/state5"] = state5_reward.mean()
+    reward_components["r/state6"] = state6_reward.mean()
+    reward_components["r/BSR"]    = BSR.mean()
 
     # Compute resets
     reset_buf = torch.where(
