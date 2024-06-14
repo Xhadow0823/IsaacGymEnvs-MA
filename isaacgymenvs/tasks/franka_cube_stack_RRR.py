@@ -511,6 +511,8 @@ class FrankaCubeStackRRR(VecTask):
         return self.obs_buf
 
     def reset_idx(self, env_ids):
+        self.has_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
         env_ids_int32 = env_ids.to(dtype=torch.int32)
 
         # Reset cubes, sampling cube B first, then A
@@ -744,7 +746,16 @@ class FrankaCubeStackRRR(VecTask):
         # you can log other information in extras here
     
         if self.viewer:
-            print( self.states["FSM"] )
+            cubeA_align_cubeB = (torch.norm(self.states["cubeA_to_cubeB_pos"][:, :2], dim=-1) < (self.states["cubeA_size"]*0.5))
+            cubeA_height_enough = (self.states["cubeA_pos"][:, 2] - self.reward_settings["table_height"]) > self.states["cubeB_size"]
+            a_gripper = self.actions[:, -1]
+            is_gripper_open = a_gripper >= 0
+            is_success_now = cubeA_align_cubeB & cubeA_height_enough & is_gripper_open
+            self.has_success = self.has_success | is_success_now
+            
+            print(self.has_success.to(dtype=torch.float).mean())
+            
+            # print( self.states["FSM"] )
             pass
         ############################# DEBUG ZONE #################################
 
