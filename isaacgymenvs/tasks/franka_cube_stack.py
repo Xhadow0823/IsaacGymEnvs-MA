@@ -168,6 +168,10 @@ class FrankaCubeStack(VecTask):
         self.cmd_limit = to_torch([0.1, 0.1, 0.1, 0.5, 0.5, 0.5], device=self.device).unsqueeze(0) if \
         self.control_type == "osc" else self._franka_effort_limits[:7].unsqueeze(0)
 
+
+        self.has_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        'this is for calc success rate, and will be reset in reset_idx using env_ids'
+
         # Reset all environments
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
 
@@ -466,7 +470,7 @@ class FrankaCubeStack(VecTask):
         return self.obs_buf
 
     def reset_idx(self, env_ids):
-        self.has_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # self.has_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device) # NOTE: THIS IS WRONG
 
         env_ids_int32 = env_ids.to(dtype=torch.int32)
 
@@ -522,6 +526,7 @@ class FrankaCubeStack(VecTask):
 
         self.progress_buf[env_ids] = 0
         self.reset_buf[env_ids] = 0
+        self.has_success[env_ids] = 0
 
     def _reset_init_cube_state(self, cube, env_ids, check_valid=True):
         """
@@ -667,6 +672,19 @@ class FrankaCubeStack(VecTask):
     def post_physics_step(self):
         self.progress_buf += 1
 
+        # ===== CALC SUCCESS RATE HERE =====
+        cubeA_align_cubeB = (torch.norm(self.states["cubeA_to_cubeB_pos"][:, :2], dim=-1) < (self.states["cubeA_size"]*0.5))
+        cubeA_height_enough = (self.states["cubeA_pos"][:, 2] - self.reward_settings["table_height"]) > self.states["cubeB_size"]
+        a_gripper = self.actions[:, -1]
+        is_gripper_open = a_gripper >= 0
+        is_success_now = cubeA_align_cubeB & cubeA_height_enough & is_gripper_open
+        self.has_success = self.has_success | is_success_now
+        success_rate = self.has_success.to(dtype=torch.float).mean()
+        self.extras.update({
+            "r/SR": success_rate
+        })
+        # ===== CALC SUCCESS RATE HERE =====
+
         env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(env_ids) > 0:
             self.reset_idx(env_ids)
@@ -700,17 +718,17 @@ class FrankaCubeStack(VecTask):
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0.1, 0.1, 0.85])
         # ===== debug area =====
         # you can log other information in extras here
-        cubeA_align_cubeB = (torch.norm(self.states["cubeA_to_cubeB_pos"][:, :2], dim=-1) < (self.states["cubeA_size"]*0.5))
-        cubeA_height_enough = (self.states["cubeA_pos"][:, 2] - self.reward_settings["table_height"]) > self.states["cubeB_size"]
-        a_gripper = self.actions[:, -1]
-        is_gripper_open = a_gripper >= 0
-        is_success_now = cubeA_align_cubeB & cubeA_height_enough & is_gripper_open
-        self.has_success = self.has_success | is_success_now
+        # cubeA_align_cubeB = (torch.norm(self.states["cubeA_to_cubeB_pos"][:, :2], dim=-1) < (self.states["cubeA_size"]*0.5))
+        # cubeA_height_enough = (self.states["cubeA_pos"][:, 2] - self.reward_settings["table_height"]) > self.states["cubeB_size"]
+        # a_gripper = self.actions[:, -1]
+        # is_gripper_open = a_gripper >= 0
+        # is_success_now = cubeA_align_cubeB & cubeA_height_enough & is_gripper_open
+        # self.has_success = self.has_success | is_success_now
         
-        success_rate = self.has_success.to(dtype=torch.float).mean()
-        self.extras.update({
-            "r/SR": success_rate
-        })
+        # success_rate = self.has_success.to(dtype=torch.float).mean()
+        # self.extras.update({
+        #     "r/SR": success_rate
+        # })
         if self.viewer:
             print(success_rate)
             # print( self.states["FSM"] )
