@@ -673,16 +673,16 @@ class FrankaCubeStack(VecTask):
         self.progress_buf += 1
 
         # ===== CALC SUCCESS RATE HERE =====
-        cubeA_align_cubeB = (torch.norm(self.states["cubeA_to_cubeB_pos"][:, :2], dim=-1) < (self.states["cubeA_size"]*0.5))
-        cubeA_height_enough = (self.states["cubeA_pos"][:, 2] - self.reward_settings["table_height"]) > self.states["cubeB_size"]
-        a_gripper = self.actions[:, -1]
-        is_gripper_open = a_gripper >= 0
-        is_success_now = cubeA_align_cubeB & cubeA_height_enough & is_gripper_open
-        self.has_success = self.has_success | is_success_now
-        success_rate = self.has_success.to(dtype=torch.float).mean()
-        self.extras.update({
-            "r/SR": success_rate
-        })
+        # cubeA_align_cubeB = (torch.norm(self.states["cubeA_to_cubeB_pos"][:, :2], dim=-1) < (self.states["cubeA_size"]*0.5))
+        # cubeA_height_enough = (self.states["cubeA_pos"][:, 2] - self.reward_settings["table_height"]) > self.states["cubeB_size"]
+        # a_gripper = self.actions[:, -1]
+        # is_gripper_open = a_gripper >= 0
+        # is_success_now = cubeA_align_cubeB & cubeA_height_enough & is_gripper_open
+        # self.has_success = self.has_success | is_success_now
+        # success_rate = self.has_success.to(dtype=torch.float).mean()
+        # self.extras.update({
+        #     "r/SR": success_rate
+        # })
         # ===== CALC SUCCESS RATE HERE =====
 
         env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
@@ -718,17 +718,16 @@ class FrankaCubeStack(VecTask):
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0.1, 0.1, 0.85])
         # ===== debug area =====
         # you can log other information in extras here
-        # cubeA_align_cubeB = (torch.norm(self.states["cubeA_to_cubeB_pos"][:, :2], dim=-1) < (self.states["cubeA_size"]*0.5))
-        # cubeA_height_enough = (self.states["cubeA_pos"][:, 2] - self.reward_settings["table_height"]) > self.states["cubeB_size"]
-        # a_gripper = self.actions[:, -1]
-        # is_gripper_open = a_gripper >= 0
-        # is_success_now = cubeA_align_cubeB & cubeA_height_enough & is_gripper_open
-        # self.has_success = self.has_success | is_success_now
-        
-        # success_rate = self.has_success.to(dtype=torch.float).mean()
-        # self.extras.update({
-        #     "r/SR": success_rate
-        # })
+        cubeA_align_cubeB = (torch.norm(self.states["cubeA_to_cubeB_pos"][:, :2], dim=-1) < (self.states["cubeA_size"]*0.5))
+        cubeA_height_enough = (self.states["cubeA_pos"][:, 2] - self.reward_settings["table_height"]) > self.states["cubeB_size"]
+        a_gripper = self.actions[:, -1]
+        is_gripper_open = a_gripper >= 0
+        is_success_now = cubeA_align_cubeB & cubeA_height_enough & is_gripper_open
+        self.has_success = self.has_success | is_success_now
+        success_rate = self.has_success.to(dtype=torch.float).mean()
+        self.extras.update({
+            "r/SR": success_rate
+        })
         if self.viewer:
             print(success_rate)
             # print( self.states["FSM"] )
