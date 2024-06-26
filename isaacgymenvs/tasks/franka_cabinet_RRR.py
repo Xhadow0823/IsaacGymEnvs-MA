@@ -7,7 +7,7 @@ from isaacgym import gymutil, gymtorch, gymapi
 from isaacgymenvs.utils.torch_jit_utils import to_torch, get_axis_params, tensor_clamp, tf_vector, tf_combine, quat_apply
 from .base.vec_task import VecTask
 from torch import Tensor
-from typing import Tuple
+from typing import Tuple, Dict
 
 
 class FrankaCabinetRRR(VecTask):
@@ -45,11 +45,11 @@ class FrankaCabinetRRR(VecTask):
         self.prop_length = 0.08
         self.prop_spacing = 0.09
 
-        num_obs = 23
+        num_obs = 23 + 1  # plus a preprocessed sub-task index = 24
         num_acts = 9
 
-        self.cfg["env"]["numObservations"] = 23
-        self.cfg["env"]["numActions"] = 9
+        self.cfg["env"]["numObservations"] = num_obs
+        self.cfg["env"]["numActions"] = num_acts
 
         super().__init__(config=self.cfg, rl_device=rl_device, sim_device=sim_device, graphics_device_id=graphics_device_id, headless=headless, virtual_screen_capture=virtual_screen_capture, force_render=force_render)
 
@@ -329,14 +329,48 @@ class FrankaCabinetRRR(VecTask):
         self.franka_rfinger_rot = torch.zeros_like(self.franka_local_grasp_rot)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.reset_buf[:] = compute_franka_reward(
+        self.rew_buf[:], self.reset_buf[:], self.reward_components = compute_reward(
             self.reset_buf, self.progress_buf, self.actions, self.cabinet_dof_pos,
             self.franka_grasp_pos, self.drawer_grasp_pos, self.franka_grasp_rot, self.drawer_grasp_rot,
             self.franka_lfinger_pos, self.franka_rfinger_pos,
             self.gripper_forward_axis, self.drawer_inward_axis, self.gripper_up_axis, self.drawer_up_axis,
             self.num_envs, self.dist_reward_scale, self.rot_reward_scale, self.around_handle_reward_scale, self.open_reward_scale,
-            self.finger_dist_reward_scale, self.action_penalty_scale, self.distX_offset, self.max_episode_length
+            self.finger_dist_reward_scale, self.action_penalty_scale, self.distX_offset, self.max_episode_length, self.FSM
         )
+        self.extras.update(self.reward_components)  # log reward components in tensorboard
+        # self.rew_buf[:], self.reset_buf[:] = compute_franka_reward(
+        #     self.reset_buf, self.progress_buf, self.actions, self.cabinet_dof_pos,
+        #     self.franka_grasp_pos, self.drawer_grasp_pos, self.franka_grasp_rot, self.drawer_grasp_rot,
+        #     self.franka_lfinger_pos, self.franka_rfinger_pos,
+        #     self.gripper_forward_axis, self.drawer_inward_axis, self.gripper_up_axis, self.drawer_up_axis,
+        #     self.num_envs, self.dist_reward_scale, self.rot_reward_scale, self.around_handle_reward_scale, self.open_reward_scale,
+        #     self.finger_dist_reward_scale, self.action_penalty_scale, self.distX_offset, self.max_episode_length
+        # )
+
+    def compute_FSM(self):
+        'sub-task transition function'
+        # sub-task 0
+        FSM = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+        tip_offset = (torch.tensor([0, 0, 1], device=self.device) * 0.04).repeat((self.num_envs, 1))
+        finger_l_tip = (self.franka_lfinger_pos + quat_apply(self.franka_grasp_rot, tip_offset))
+        finger_r_tip = (self.franka_rfinger_pos + quat_apply(self.franka_grasp_rot, tip_offset))
+        finger_tips_center = (finger_l_tip + finger_r_tip) * 0.5
+        
+        tips_center_drawer_diff = torch.abs(self.drawer_grasp_pos - finger_tips_center)
+        is_can_hold = (tips_center_drawer_diff[:, 0] <= 0.01) & (tips_center_drawer_diff[:, 1] <= 0.06) & (tips_center_drawer_diff[:, 2] <= 0.01)
+        FSM = torch.where(is_can_hold, 1, FSM)
+
+        tips_dist = torch.norm(finger_l_tip - finger_r_tip, dim=-1)
+        is_holding = is_can_hold & (tips_dist <= 0.025)
+        FSM = torch.where(is_holding, 2, FSM)
+
+        # is_GOAL = (self.cabinet_dof_pos[:, 3] >= 0.2)
+        # FSM = torch.where(is_GOAL, 10, FSM)
+        
+        # TODO: try add more state with drawing
+
+        return FSM
 
     def compute_observations(self):
 
@@ -362,8 +396,13 @@ class FrankaCabinetRRR(VecTask):
         dof_pos_scaled = (2.0 * (self.franka_dof_pos - self.franka_dof_lower_limits)
                           / (self.franka_dof_upper_limits - self.franka_dof_lower_limits) - 1.0)
         to_target = self.drawer_grasp_pos - self.franka_grasp_pos
+
+        self.FSM = self.compute_FSM()
         self.obs_buf = torch.cat((dof_pos_scaled, self.franka_dof_vel * self.dof_vel_scale, to_target,
-                                  self.cabinet_dof_pos[:, 3].unsqueeze(-1), self.cabinet_dof_vel[:, 3].unsqueeze(-1)), dim=-1)
+                                  self.cabinet_dof_pos[:, 3].unsqueeze(-1), self.cabinet_dof_vel[:, 3].unsqueeze(-1),
+                                  torch.pow(2.0, self.FSM.view(self.num_envs, -1))  # get current sub-task index from sub-task transition function
+                                  ), dim=-1)
+        
 
         return self.obs_buf
 
@@ -435,50 +474,129 @@ class FrankaCabinetRRR(VecTask):
             self.gym.refresh_rigid_body_state_tensor(self.sim)
 
             for i in range(self.num_envs):
-                px = (self.franka_grasp_pos[i] + quat_apply(self.franka_grasp_rot[i], to_torch([1, 0, 0], device=self.device) * 0.2)).cpu().numpy()
-                py = (self.franka_grasp_pos[i] + quat_apply(self.franka_grasp_rot[i], to_torch([0, 1, 0], device=self.device) * 0.2)).cpu().numpy()
-                pz = (self.franka_grasp_pos[i] + quat_apply(self.franka_grasp_rot[i], to_torch([0, 0, 1], device=self.device) * 0.2)).cpu().numpy()
-
-                p0 = self.franka_grasp_pos[i].cpu().numpy()
-                self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], px[0], px[1], px[2]], [0.85, 0.1, 0.1])
-                self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], py[0], py[1], py[2]], [0.1, 0.85, 0.1])
-                self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0.1, 0.1, 0.85])
+                # px = (self.franka_grasp_pos[i] + quat_apply(self.franka_grasp_rot[i], to_torch([1, 0, 0], device=self.device) * 0.2)).cpu().numpy()
+                # py = (self.franka_grasp_pos[i] + quat_apply(self.franka_grasp_rot[i], to_torch([0, 1, 0], device=self.device) * 0.2)).cpu().numpy()
+                # pz = (self.franka_grasp_pos[i] + quat_apply(self.franka_grasp_rot[i], to_torch([0, 0, 1], device=self.device) * 0.2)).cpu().numpy()
+                # p0 = self.franka_grasp_pos[i].cpu().numpy()
+                # self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], px[0], px[1], px[2]], [0.85, 0.1, 0.1])
+                # self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], py[0], py[1], py[2]], [0.1, 0.85, 0.1])
+                # self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0.1, 0.1, 0.85])
 
                 px = (self.drawer_grasp_pos[i] + quat_apply(self.drawer_grasp_rot[i], to_torch([1, 0, 0], device=self.device) * 0.2)).cpu().numpy()
                 py = (self.drawer_grasp_pos[i] + quat_apply(self.drawer_grasp_rot[i], to_torch([0, 1, 0], device=self.device) * 0.2)).cpu().numpy()
                 pz = (self.drawer_grasp_pos[i] + quat_apply(self.drawer_grasp_rot[i], to_torch([0, 0, 1], device=self.device) * 0.2)).cpu().numpy()
-
                 p0 = self.drawer_grasp_pos[i].cpu().numpy()
                 self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], px[0], px[1], px[2]], [1, 0, 0])
                 self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], py[0], py[1], py[2]], [0, 1, 0])
                 self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0, 0, 1])
 
-                px = (self.franka_lfinger_pos[i] + quat_apply(self.franka_lfinger_rot[i], to_torch([1, 0, 0], device=self.device) * 0.2)).cpu().numpy()
-                py = (self.franka_lfinger_pos[i] + quat_apply(self.franka_lfinger_rot[i], to_torch([0, 1, 0], device=self.device) * 0.2)).cpu().numpy()
-                pz = (self.franka_lfinger_pos[i] + quat_apply(self.franka_lfinger_rot[i], to_torch([0, 0, 1], device=self.device) * 0.2)).cpu().numpy()
+                # px = (self.franka_lfinger_pos[i] + quat_apply(self.franka_lfinger_rot[i], to_torch([1, 0, 0], device=self.device) * 0.2)).cpu().numpy()
+                # py = (self.franka_lfinger_pos[i] + quat_apply(self.franka_lfinger_rot[i], to_torch([0, 1, 0], device=self.device) * 0.2)).cpu().numpy()
+                # pz = (self.franka_lfinger_pos[i] + quat_apply(self.franka_lfinger_rot[i], to_torch([0, 0, 1], device=self.device) * 0.2)).cpu().numpy()
+                # p0 = self.franka_lfinger_pos[i].cpu().numpy()
+                # self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], px[0], px[1], px[2]], [1, 0, 0])
+                # self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], py[0], py[1], py[2]], [0, 1, 0])
+                # self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0, 0, 1])
 
-                p0 = self.franka_lfinger_pos[i].cpu().numpy()
-                self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], px[0], px[1], px[2]], [1, 0, 0])
-                self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], py[0], py[1], py[2]], [0, 1, 0])
-                self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0, 0, 1])
+                # px = (self.franka_rfinger_pos[i] + quat_apply(self.franka_rfinger_rot[i], to_torch([1, 0, 0], device=self.device) * 0.2)).cpu().numpy()
+                # py = (self.franka_rfinger_pos[i] + quat_apply(self.franka_rfinger_rot[i], to_torch([0, 1, 0], device=self.device) * 0.2)).cpu().numpy()
+                # pz = (self.franka_rfinger_pos[i] + quat_apply(self.franka_rfinger_rot[i], to_torch([0, 0, 1], device=self.device) * 0.2)).cpu().numpy()
+                # p0 = self.franka_rfinger_pos[i].cpu().numpy()
+                # self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], px[0], px[1], px[2]], [1, 0, 0])
+                # self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], py[0], py[1], py[2]], [0, 1, 0])
+                # self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0, 0, 1])
 
-                px = (self.franka_rfinger_pos[i] + quat_apply(self.franka_rfinger_rot[i], to_torch([1, 0, 0], device=self.device) * 0.2)).cpu().numpy()
-                py = (self.franka_rfinger_pos[i] + quat_apply(self.franka_rfinger_rot[i], to_torch([0, 1, 0], device=self.device) * 0.2)).cpu().numpy()
-                pz = (self.franka_rfinger_pos[i] + quat_apply(self.franka_rfinger_rot[i], to_torch([0, 0, 1], device=self.device) * 0.2)).cpu().numpy()
+                # finger tips
+                plt = (self.franka_lfinger_pos[i] + quat_apply(self.franka_lfinger_rot[i], to_torch([0, 0, 1], device=self.device) * 0.04)).cpu().numpy()
+                prt = (self.franka_rfinger_pos[i] + quat_apply(self.franka_rfinger_rot[i], to_torch([0, 0, 1], device=self.device) * 0.04)).cpu().numpy()
+                # p0 = self.franka_lfinger_pos[i].cpu().numpy()
+                # self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], plt[0], plt[1], plt[2]], [0.85, 0.1, 0.85])
+                # p0 = self.franka_rfinger_pos[i].cpu().numpy()
+                # self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], prt[0], prt[1], prt[2]], [0.85, 0.1, 0.85])
+                pct = (plt + prt) / 2.
+                p0 = self.franka_grasp_pos[i].cpu().numpy()
+                self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pct[0], pct[1], pct[2]], [0.1, 0.85, 0.85])
 
-                p0 = self.franka_rfinger_pos[i].cpu().numpy()
-                self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], px[0], px[1], px[2]], [1, 0, 0])
-                self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], py[0], py[1], py[2]], [0, 1, 0])
-                self.gym.add_lines(self.viewer, self.envs[i], 1, [p0[0], p0[1], p0[2], pz[0], pz[1], pz[2]], [0, 0, 1])
+
+        # ========== DEBUG ZONE ==========
+
         if self.viewer:
-            how_open = self.cabinet_dof_pos[:, 3]
+            tip_offset = (torch.tensor([0, 0, 1], device=self.device) * 0.04).repeat((self.num_envs, 1))
+            finger_l_tip = (self.franka_lfinger_pos + quat_apply(self.franka_grasp_rot, tip_offset))
+            finger_r_tip = (self.franka_rfinger_pos + quat_apply(self.franka_grasp_rot, tip_offset))
+            finger_tips_center = (finger_l_tip + finger_r_tip) * 0.5
+            # tips_center_drawer_dist = torch.norm(self.drawer_grasp_pos - finger_tips_center, dim=-1)
+            # print( tips_center_drawer_dist[1] ) # <= 0.02
+            # print( torch.abs(self.drawer_grasp_pos - finger_tips_center)[1] )  # 0.02, 0.06 , 0.01
             
-            print(how_open[0])
+            tips_dist = torch.norm(finger_l_tip - finger_r_tip, dim=-1)  # <= 0.025 (quite loose)
+            close_reward = torch.exp(-1000 * (tips_dist - 0.02)**2)
+            # print( tips_dist[1], close_reward[1] )
+
+            # print( self.cabinet_dof_pos[1, 3], (self.franka_grasp_pos[1, 0]-0.3515) )
+            # print( (self.franka_grasp_pos[1, 0]-0.3515) )
+            
+            print( self.FSM[1] )
 
 #####################################################################
 ###=========================jit functions=========================###
 #####################################################################
 
+@torch.jit.script
+def compute_reward(
+    reset_buf, progress_buf, actions, cabinet_dof_pos,
+    franka_grasp_pos, drawer_grasp_pos, franka_grasp_rot, drawer_grasp_rot,
+    franka_lfinger_pos, franka_rfinger_pos,
+    gripper_forward_axis, drawer_inward_axis, gripper_up_axis, drawer_up_axis,
+    num_envs, dist_reward_scale, rot_reward_scale, around_handle_reward_scale, open_reward_scale,
+    finger_dist_reward_scale, action_penalty_scale, distX_offset, max_episode_length, FSM
+):
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int, float, float, float, float, float, float, float, float, Tensor) -> Tuple[Tensor, Tensor, Dict[str,Tensor]]
+    'Cabinet task reward function in R3D'
+
+    # initialization
+    rewards = torch.zeros(franka_grasp_pos.shape[0], dtype=torch.float, device=franka_grasp_pos.device)
+    reward_components = {}
+
+    tip_offset = (torch.tensor([0, 0, 1], device=rewards.device) * 0.04).repeat((num_envs, 1))
+    finger_l_tip = (franka_lfinger_pos + quat_apply(franka_grasp_rot, tip_offset))
+    finger_r_tip = (franka_rfinger_pos + quat_apply(franka_grasp_rot, tip_offset))
+    finger_tips_center = (finger_l_tip + finger_r_tip) * 0.5
+
+    tips_center_drawer_dist = torch.norm(drawer_grasp_pos - finger_tips_center, dim=-1)
+    pos_reward = torch.exp(-10 * (tips_center_drawer_dist)**2)
+    state0_reward = torch.where(FSM==0, pos_reward, torch.zeros_like(rewards))
+
+    tips_dist = torch.norm(finger_l_tip - finger_r_tip, dim=-1)
+    close_reward = torch.exp(-1000 * (tips_dist - 0.02)**2)
+    state1_reward = torch.where(FSM==1, close_reward, torch.zeros_like(rewards))
+
+    draw_reward = (cabinet_dof_pos[:, 3] / 0.2) + ((franka_grasp_pos[1, 0]-0.3515) / 0.2)
+    state2_reward = torch.where(FSM==2, draw_reward, torch.zeros_like(rewards))
+
+    # calc BSR
+    BSR = FSM.to(torch.float)
+
+    # final sum up
+    rewards = state0_reward + state1_reward + state2_reward + BSR
+    
+    # compute reset
+    reset_buf = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset_buf)
+
+    # tensorboard log
+    reward_components["r/state0"] = state0_reward.mean()
+    reward_components["r/state1"] = state1_reward.mean()
+    reward_components["r/state2"] = state2_reward.mean()
+    # reward_components["r/state3"] = state3_reward.mean()
+    reward_components["r/BSR"]    = BSR.mean()
+
+    return rewards, reset_buf, reward_components
+    
+    # - rotation align
+    axis1 = tf_vector(franka_grasp_rot, gripper_forward_axis)
+    axis2 = tf_vector(drawer_grasp_rot, drawer_inward_axis)
+    rot_align_reward = torch.bmm(axis1.view(num_envs, 1, 3), axis2.view(num_envs, 3, 1)).squeeze(-1).squeeze(-1)  # shape: num_envs x 1 x 1 -> num_envs
+    state1_reward = torch.where(FSM == 1, rot_align_reward, torch.zeros_like(rewards))
 
 @torch.jit.script
 def compute_franka_reward(
@@ -490,7 +608,7 @@ def compute_franka_reward(
     finger_dist_reward_scale, action_penalty_scale, distX_offset, max_episode_length
 ):
     # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int, float, float, float, float, float, float, float, float) -> Tuple[Tensor, Tensor]
-
+    'original Cabinet reward function'
     # distance from hand to the drawer
     d = torch.norm(franka_grasp_pos - drawer_grasp_pos, p=2, dim=-1)
     dist_reward = 1.0 / (1.0 + d ** 2)
