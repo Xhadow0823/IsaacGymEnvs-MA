@@ -365,8 +365,15 @@ class FrankaCabinetRRR(VecTask):
         is_holding = is_can_hold & (tips_dist <= 0.025)
         FSM = torch.where(is_holding, 2, FSM)
 
-        # is_GOAL = (self.cabinet_dof_pos[:, 3] >= 0.2)
-        # FSM = torch.where(is_GOAL, 10, FSM)
+        
+        is_opened_little = (self.cabinet_dof_pos[:, 3] >= 0.02)
+        FSM = torch.where(is_holding & is_opened_little, 3, FSM)
+
+        is_opened_little_more = (self.cabinet_dof_pos[:, 3] >= 0.1)
+        FSM = torch.where(is_opened_little_more, 4, FSM)
+
+        is_GOAL = (self.cabinet_dof_pos[:, 3] >= 0.2)
+        FSM = torch.where(is_GOAL, 5, FSM)
         
         # TODO: try add more state with drawing
 
@@ -533,8 +540,11 @@ class FrankaCabinetRRR(VecTask):
             close_reward = torch.exp(-1000 * (tips_dist - 0.02)**2)
             # print( tips_dist[1], close_reward[1] )
 
-            # print( self.cabinet_dof_pos[1, 3], (self.franka_grasp_pos[1, 0]-0.3515) )
-            # print( (self.franka_grasp_pos[1, 0]-0.3515) )
+            # print( self.cabinet_dof_pos[1, 3], (self.franka_grasp_pos[1, 0]-0.35) )
+
+            # print( self.cabinet_dof_pos[1, 3]>=0.02 )
+            
+            # print( finger_tips_center[1][0]-0.35 )
             
             print( self.FSM[1] )
 
@@ -571,14 +581,25 @@ def compute_reward(
     close_reward = torch.exp(-1000 * (tips_dist - 0.02)**2)
     state1_reward = torch.where(FSM==1, close_reward, torch.zeros_like(rewards))
 
-    draw_reward = (cabinet_dof_pos[:, 3] / 0.2) + ((franka_grasp_pos[1, 0]-0.3515) / 0.2)
+    # draw_reward = (cabinet_dof_pos[:, 3] / 0.2) + ((franka_grasp_pos[:, 0]-0.3515) / 0.2)
+    draw_reward = torch.exp(4 * cabinet_dof_pos[:, 3])
     state2_reward = torch.where(FSM==2, draw_reward, torch.zeros_like(rewards))
 
+    opened_reward = torch.exp(4 * cabinet_dof_pos[:, 3])
+    state345_reward = torch.where(FSM>=3, opened_reward, torch.zeros_like(rewards))
+
+    reward_components["r/open_farness"] = (cabinet_dof_pos[:, 3]).mean()
     # calc BSR
     BSR = FSM.to(torch.float)
 
     # final sum up
-    rewards = state0_reward + state1_reward + state2_reward + BSR
+    rewards = state0_reward + state1_reward + state2_reward + state345_reward + BSR
+
+    # # prevent bad pose
+    # rewards = torch.where(franka_lfinger_pos[:, 0] < drawer_grasp_pos[:, 0] - distX_offset,  # offset=0.04
+    #                       torch.ones_like(rewards) * -1, rewards)
+    # rewards = torch.where(franka_rfinger_pos[:, 0] < drawer_grasp_pos[:, 0] - distX_offset,
+    #                       torch.ones_like(rewards) * -1, rewards)
     
     # compute reset
     reset_buf = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset_buf)
@@ -587,12 +608,12 @@ def compute_reward(
     reward_components["r/state0"] = state0_reward.mean()
     reward_components["r/state1"] = state1_reward.mean()
     reward_components["r/state2"] = state2_reward.mean()
-    # reward_components["r/state3"] = state3_reward.mean()
+    reward_components["r/state3"] = state345_reward.mean()
     reward_components["r/BSR"]    = BSR.mean()
 
     return rewards, reset_buf, reward_components
     
-    # - rotation align
+    # (optional) - rotation align
     axis1 = tf_vector(franka_grasp_rot, gripper_forward_axis)
     axis2 = tf_vector(drawer_grasp_rot, drawer_inward_axis)
     rot_align_reward = torch.bmm(axis1.view(num_envs, 1, 3), axis2.view(num_envs, 3, 1)).squeeze(-1).squeeze(-1)  # shape: num_envs x 1 x 1 -> num_envs
