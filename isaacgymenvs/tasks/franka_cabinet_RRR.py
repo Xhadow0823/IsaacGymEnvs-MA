@@ -375,8 +375,6 @@ class FrankaCabinetRRR(VecTask):
         is_GOAL = (self.cabinet_dof_pos[:, 3] >= 0.2)
         FSM = torch.where(is_GOAL, 5, FSM)
         
-        # TODO: try add more state with drawing
-
         return FSM
 
     def compute_observations(self):
@@ -581,25 +579,17 @@ def compute_reward(
     close_reward = torch.exp(-1000 * (tips_dist - 0.02)**2)
     state1_reward = torch.where(FSM==1, close_reward, torch.zeros_like(rewards))
 
-    # draw_reward = (cabinet_dof_pos[:, 3] / 0.2) + ((franka_grasp_pos[:, 0]-0.3515) / 0.2)
+    # draw_reward = (cabinet_dof_pos[:, 3] / 0.2) + ((franka_grasp_pos[:, 0]-0.3515) / 0.2)  # OLD
     draw_reward = torch.exp(4 * cabinet_dof_pos[:, 3])
-    state2_reward = torch.where(FSM==2, draw_reward, torch.zeros_like(rewards))
-
-    opened_reward = torch.exp(4 * cabinet_dof_pos[:, 3])
-    state345_reward = torch.where(FSM>=3, opened_reward, torch.zeros_like(rewards))
+    state2345_reward = torch.where(FSM>=2, draw_reward, torch.zeros_like(rewards))
 
     reward_components["r/open_farness"] = (cabinet_dof_pos[:, 3]).mean()
+    
     # calc BSR
     BSR = FSM.to(torch.float)
 
     # final sum up
-    rewards = state0_reward + state1_reward + state2_reward + state345_reward + BSR
-
-    # # prevent bad pose
-    # rewards = torch.where(franka_lfinger_pos[:, 0] < drawer_grasp_pos[:, 0] - distX_offset,  # offset=0.04
-    #                       torch.ones_like(rewards) * -1, rewards)
-    # rewards = torch.where(franka_rfinger_pos[:, 0] < drawer_grasp_pos[:, 0] - distX_offset,
-    #                       torch.ones_like(rewards) * -1, rewards)
+    rewards = state0_reward + state1_reward + state2345_reward + BSR
     
     # compute reset
     reset_buf = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset_buf)
@@ -607,8 +597,7 @@ def compute_reward(
     # tensorboard log
     reward_components["r/state0"] = state0_reward.mean()
     reward_components["r/state1"] = state1_reward.mean()
-    reward_components["r/state2"] = state2_reward.mean()
-    reward_components["r/state3"] = state345_reward.mean()
+    reward_components["r/state2"] = state2345_reward.mean()
     reward_components["r/BSR"]    = BSR.mean()
 
     return rewards, reset_buf, reward_components
