@@ -588,9 +588,21 @@ def compute_reward(
     # calc BSR
     BSR = FSM.to(torch.float)
 
+    axis1 = tf_vector(franka_grasp_rot, gripper_forward_axis)
+    axis2 = tf_vector(drawer_grasp_rot, drawer_inward_axis)
+    rot_penalty = -1. + torch.bmm(axis1.view(num_envs, 1, 3), axis2.view(num_envs, 3, 1)).squeeze(-1).squeeze(-1)  # shape: num_envs x 1 x 1 -> num_envs
+    rot_penalty = rot_penalty * 0.5
+    reward_components["r/rot_penalty"] = rot_penalty.mean()
+
     # final sum up
-    rewards = state0_reward + state1_reward + state2345_reward + BSR
+    # rewards = state0_reward + state1_reward + state2345_reward + BSR
+    rewards = state0_reward + state1_reward + state2345_reward + BSR + rot_penalty
     
+    # rot_sub_policy = torch.bmm(axis1.view(num_envs, 1, 3), axis2.view(num_envs, 3, 1)).squeeze(-1).squeeze(-1)  # shape: num_envs x 1 x 1 -> num_envs
+    # rot_sub_policy = torch.clamp(rot_sub_policy, 0.5, 1)
+    # rewards = (state0_reward + state1_reward + state2345_reward) * rot_sub_policy + BSR
+    # reward_components["r/rot_sub_policy"] = rot_sub_policy.mean()
+
     # compute reset
     reset_buf = torch.where(progress_buf >= max_episode_length - 1, torch.ones_like(reset_buf), reset_buf)
 

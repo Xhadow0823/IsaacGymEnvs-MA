@@ -822,7 +822,15 @@ def compute_franka_reward(
     # state-up reward (BSR)
     BSR = states["FSM"].to(torch.float)
 
-    rewards = state0_reward + state1_reward + state2_reward + state3_reward + state4_reward + state5_reward + state6_reward +  BSR
+    action_penalty = torch.norm(actions, dim=-1) * -0.05
+
+    # rewards = state0_reward + state1_reward + state2_reward + state3_reward + state4_reward + state5_reward + state6_reward +  BSR
+    rewards = state0_reward + state1_reward + state2_reward + state3_reward + state4_reward + state5_reward + state6_reward +  BSR + action_penalty  # with action penalty 0.1
+
+    # action_sub_policy = 1 - (torch.norm(actions, dim=-1) - 0.9)
+    # action_sub_policy = torch.clamp(action_sub_policy, 0, 1)
+    # rewards = (state0_reward + state1_reward + state2_reward + state3_reward + state4_reward + state5_reward + state6_reward) * action_sub_policy +  BSR
+    # reward_components["r/action_sub_policy"] = action_sub_policy.mean() # with action penalty 0.1
 
     rewards = torch.clip(rewards, 0., None)
 
@@ -834,6 +842,7 @@ def compute_franka_reward(
     reward_components["r/state5"] = state5_reward.mean()
     reward_components["r/state6"] = state6_reward.mean()
     reward_components["r/BSR"]    = BSR.mean()
+    reward_components["r/action_penalty"] = action_penalty.mean() # with action penalty 0.1
 
     # Compute resets
     reset_buf = torch.where(

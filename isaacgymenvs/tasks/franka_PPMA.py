@@ -595,6 +595,7 @@ class FrankaPPMA(VecTask):
         return state_machine  # shape: [num_envs x num_agents]
     
     def compute_global_FSM(self):
+        'OLD K4'
         # FSM = self.states["FSM"]  # shape: [num_envs x num_agents]
         gFSM = torch.ones(self.num_envs * 2, dtype=torch.long, device=self.device)  # shape: [num_envs,]
 
@@ -1002,16 +1003,21 @@ class FrankaPPMA(VecTask):
                     # self.gym.add_lines(self.viewer, self.envs[i], 1, [*from_p, *to_p], [0.85, 0.1, 0.85])
                     self.gym.add_lines(self.viewer, self.envs[i], 1, [*from_p, *to_p], [0.85, 0.1, 0.85])
             
-            ep = self.states["eef_pos"][1]
-            d_ep = torch.norm(ep[1] - ep[0])
+            ep = self.states["eef_pos"]
+            d_ep = torch.norm(ep[:, 1] - ep[:, 0], dim=-1).repeat_interleave(2) # num_envs x 1
 
-            cp = self.states["cubeA_pos"][1]
-            d_ecp = torch.tensor([torch.norm(ep[0] - cp[1]), torch.norm(ep[1] - cp[0])])
+            cp = self.states["cubeA_pos"]
+            d_cp = torch.stack([torch.norm(ep[:, 0] - cp[:, 1], dim=-1), torch.norm(ep[:, 1] - cp[:, 0], dim=-1)]).flatten()  # num_envs * num_agents
+
+            mdp = torch.min(d_ep, d_cp)
+            close_penalty = (-1 + mdp[1]) * 0.3
+
             if self.viewer: 
                 FSM = self.states["FSM"][1]  # only env1
                 print(FSM)
-                # print(d_ep, d_ep.to(float)<0.18)
-                print( d_ecp < 0.15 )
+                
+                # print((d_ep[1], d_cp[1]))
+                print(close_penalty)
 
 
         
@@ -1078,12 +1084,12 @@ class FrankaPPMA(VecTask):
 ###=========================jit functions=========================###
 #####################################################################
 
-
 @torch.jit.script
 def compute_franka_reward(
     reset_buf, progress_buf, actions, states, hands_contact_forces, reward_settings, max_episode_length
 ):
     # type: (Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor, Dict[str, float], float) -> Tuple[Tensor, Tensor, Dict[str,Tensor]]
+    'NEW'
     reward_components = {}
     md = torch.norm(states["cubeA_pos_relative"].view(-1, 3), dim=-1)
     FSM = states["FSM"].flatten()  # shape: [envs x agents] -> [envs*agents]
@@ -1091,11 +1097,11 @@ def compute_franka_reward(
     rewards = torch.zeros_like(md)
 
     # state 0 - approaching
-    approaching_reward = torch.exp(-5. * (md**2))
+    approaching_reward = 1. / (0.5 + md**2) * 0.5
     state0_reward = torch.where(FSM == 0, approaching_reward, torch.zeros_like(md))
 
     # state 1 - gripper closing
-    gripper_closing_reward = torch.exp(-1. * actions[:, -1])  # go to state 2 when a_gripper<0
+    gripper_closing_reward = torch.tanh(-actions[:, -1] * 3.0) + 1.
     state1_reward = torch.where(FSM == 1, gripper_closing_reward, torch.zeros_like(md))
 
     # state 2 - lifting
@@ -1106,45 +1112,37 @@ def compute_franka_reward(
     # state 3 - aligning
     target_pos_offset = torch.tensor([0., 0., 0.05], device=md.device)
     d_to_target = torch.norm(states["dest_cubeA_relative"]+target_pos_offset, dim=-1)
-    align_reward = torch.exp(-3. * d_to_target).flatten()
+    align_reward = (torch.tanh(-5. * d_to_target) + 1.).flatten()
     state3_reward = torch.where(FSM == 3, align_reward, torch.zeros_like(md))
 
     # state 4 - super-closing
     target_pos_offset = torch.tensor([0., 0., 0.05], device=md.device)
     d_to_dest = torch.norm(states["dest_cubeA_relative"] + target_pos_offset, dim=-1)
-    desc_reward = (torch.exp(-10. * d_to_dest)).flatten()  # rev4.2   # -10 is sensitive enough for learning super-close sub-policy
+    desc_reward = (torch.tanh(-6. * d_to_dest) + 1.).flatten()
     state4_reward = torch.where(FSM == 4, desc_reward, torch.zeros_like(md))
 
     # state 5 - gripper opening
-    gripper_opening_reward = torch.exp(5. * actions[:, -1])  # go to state 2 when a_gripper>0
+    gripper_opening_reward = torch.tanh(2. * actions[:, -1]) + 1
     state5_reward = torch.where(FSM == 5, gripper_opening_reward, torch.zeros_like(md))
 
     # state 6 - GOAL
-    away_reward = torch.tanh(md)
-    state6_reward = torch.where(FSM == 6, away_reward, torch.zeros_like(md))  # rev 4.1
-
+    away_reward = torch.tanh(7. * md)
+    state6_reward = torch.where(FSM == 6, away_reward, torch.zeros_like(md))
 
     # BSR
     BSR = FSM.to(torch.float)
-    gBSR = gFSM.to(torch.float) * 0.5
-    # gBSR = torch.zeros_like(BSR)
-    
-    # ep = states["eef_pos"]
-    # d_ep = torch.norm(ep[:, 1] - ep[:, 0], dim=-1).repeat_interleave(2) # num_envs * num_agents
-    # cp = states["cubeA_pos"]
-    # d_ecp = torch.stack([torch.norm(ep[:, 0] - cp[:, 1], dim=-1), torch.norm(ep[:, 1] - cp[:, 0], dim=-1)]).flatten()  # num_envs * num_agents
-    # gBSR += torch.tanh((d_ep + d_ecp) * 0.5 * 10)-1
-    # gBSR *= 0.5
+    # gBSR = gFSM.to(torch.float) * 0.5
 
-    # side rules
-    # is_collision = (torch.norm(hands_contact_forces.reshape(-1, 3), dim=-1) >= 0.01)
-    # no_collision_reward = (~is_collision) * 1.
-    # side_rule_reward = no_collision_reward  # torch.zeros_like(md)
-    side_rule_reward = torch.zeros_like(md)
+    ep = states["eef_pos"]
+    d_ep = torch.norm(ep[:, 1] - ep[:, 0], dim=-1).repeat_interleave(2)  # num_envs x 1 -> num_envs * num_agents
+    cp = states["cubeA_pos"]
+    d_cp = torch.stack([torch.norm(ep[:, 0] - cp[:, 1], dim=-1), torch.norm(ep[:, 1] - cp[:, 0], dim=-1)]).flatten()  # num_envs * num_agents
+    mdp = torch.min(d_ep, d_cp)
+    close_penalty = (-1 + mdp[1]) * 0.3
+    reward_components["r/close_penalty"] = close_penalty.mean()
 
     # sum up 
-    # rewards = state0_reward + state1_reward + state2_reward + state3_reward + state4_reward + state5_reward + state6_reward +   BSR + gBSR + side_rule_reward
-    rewards = state0_reward + state1_reward + state2_reward + state3_reward + state4_reward + state5_reward + state6_reward +  BSR + gBSR + side_rule_reward
+    rewards = state0_reward + state1_reward + state2_reward + state3_reward + state4_reward + state5_reward + state6_reward + BSR  + close_penalty
 
     rewards = torch.clip(rewards, 0., None)
 
@@ -1157,11 +1155,96 @@ def compute_franka_reward(
     reward_components["r/state5"] = state5_reward.mean()
     reward_components["r/state6"] = state6_reward.mean()
     reward_components["r/BSR"] = BSR.mean()
-    reward_components["r/gBSR"] = gBSR.mean()
-    reward_components["r/side_rule"] = side_rule_reward.mean()
-
 
     # Compute resets
     reset_buf = torch.where((progress_buf >= max_episode_length - 1), torch.ones_like(reset_buf), reset_buf)
 
     return rewards, reset_buf, reward_components
+
+# @torch.jit.script
+# def compute_franka_reward(
+#     reset_buf, progress_buf, actions, states, hands_contact_forces, reward_settings, max_episode_length
+# ):
+#     # type: (Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor, Dict[str, float], float) -> Tuple[Tensor, Tensor, Dict[str,Tensor]]
+#     'OLD'
+#     reward_components = {}
+#     md = torch.norm(states["cubeA_pos_relative"].view(-1, 3), dim=-1)
+#     FSM = states["FSM"].flatten()  # shape: [envs x agents] -> [envs*agents]
+#     gFSM = states["gFSM"]
+#     rewards = torch.zeros_like(md)
+
+#     # state 0 - approaching
+#     approaching_reward = torch.exp(-5. * (md**2))
+#     state0_reward = torch.where(FSM == 0, approaching_reward, torch.zeros_like(md))
+
+#     # state 1 - gripper closing
+#     gripper_closing_reward = torch.exp(-1. * actions[:, -1])  # go to state 2 when a_gripper<0
+#     state1_reward = torch.where(FSM == 1, gripper_closing_reward, torch.zeros_like(md))
+
+#     # state 2 - lifting
+#     diff_of_target_z = abs(states["dest_cubeA_relative"][..., 2])
+#     lift_reward = torch.clip((diff_of_target_z / ((0.05+0.05) * 0.5)), 0., 1.).flatten()
+#     state2_reward = torch.where(FSM == 2, lift_reward, torch.zeros_like(md))
+
+#     # state 3 - aligning
+#     target_pos_offset = torch.tensor([0., 0., 0.05], device=md.device)
+#     d_to_target = torch.norm(states["dest_cubeA_relative"]+target_pos_offset, dim=-1)
+#     align_reward = torch.exp(-3. * d_to_target).flatten()
+#     state3_reward = torch.where(FSM == 3, align_reward, torch.zeros_like(md))
+
+#     # state 4 - super-closing
+#     target_pos_offset = torch.tensor([0., 0., 0.05], device=md.device)
+#     d_to_dest = torch.norm(states["dest_cubeA_relative"] + target_pos_offset, dim=-1)
+#     desc_reward = (torch.exp(-10. * d_to_dest)).flatten()  # rev4.2   # -10 is sensitive enough for learning super-close sub-policy
+#     state4_reward = torch.where(FSM == 4, desc_reward, torch.zeros_like(md))
+
+#     # state 5 - gripper opening
+#     gripper_opening_reward = torch.exp(5. * actions[:, -1])  # go to state 2 when a_gripper>0
+#     state5_reward = torch.where(FSM == 5, gripper_opening_reward, torch.zeros_like(md))
+
+#     # state 6 - GOAL
+#     away_reward = torch.tanh(md)
+#     state6_reward = torch.where(FSM == 6, away_reward, torch.zeros_like(md))  # rev 4.1
+
+
+#     # BSR
+#     BSR = FSM.to(torch.float)
+#     gBSR = gFSM.to(torch.float) * 0.5
+#     # gBSR = torch.zeros_like(BSR)
+    
+#     # ep = states["eef_pos"]
+#     # d_ep = torch.norm(ep[:, 1] - ep[:, 0], dim=-1).repeat_interleave(2) # num_envs * num_agents
+#     # cp = states["cubeA_pos"]
+#     # d_ecp = torch.stack([torch.norm(ep[:, 0] - cp[:, 1], dim=-1), torch.norm(ep[:, 1] - cp[:, 0], dim=-1)]).flatten()  # num_envs * num_agents
+#     # gBSR += torch.tanh((d_ep + d_ecp) * 0.5 * 10)-1
+#     # gBSR *= 0.5
+
+#     # side rules
+#     # is_collision = (torch.norm(hands_contact_forces.reshape(-1, 3), dim=-1) >= 0.01)
+#     # no_collision_reward = (~is_collision) * 1.
+#     # side_rule_reward = no_collision_reward  # torch.zeros_like(md)
+#     side_rule_reward = torch.zeros_like(md)
+
+#     # sum up 
+#     # rewards = state0_reward + state1_reward + state2_reward + state3_reward + state4_reward + state5_reward + state6_reward +   BSR + gBSR + side_rule_reward
+#     rewards = state0_reward + state1_reward + state2_reward + state3_reward + state4_reward + state5_reward + state6_reward +  BSR + gBSR + side_rule_reward
+
+#     rewards = torch.clip(rewards, 0., None)
+
+#     # for log
+#     reward_components["r/state0"] = state0_reward.mean()
+#     reward_components["r/state1"] = state1_reward.mean()
+#     reward_components["r/state2"] = state2_reward.mean()
+#     reward_components["r/state3"] = state3_reward.mean()
+#     reward_components["r/state4"] = state4_reward.mean()
+#     reward_components["r/state5"] = state5_reward.mean()
+#     reward_components["r/state6"] = state6_reward.mean()
+#     reward_components["r/BSR"] = BSR.mean()
+#     reward_components["r/gBSR"] = gBSR.mean()
+#     reward_components["r/side_rule"] = side_rule_reward.mean()
+
+
+#     # Compute resets
+#     reset_buf = torch.where((progress_buf >= max_episode_length - 1), torch.ones_like(reset_buf), reset_buf)
+
+#     return rewards, reset_buf, reward_components
